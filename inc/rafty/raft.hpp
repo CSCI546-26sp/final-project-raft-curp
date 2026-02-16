@@ -114,6 +114,29 @@ private:
 
   void send_heartbeats(uint64_t term);
   void send_request_votes(uint64_t term);
+
+  // Raft states
+  enum class Role {
+    Follower,
+    Candidate,
+    Leader
+  };
+
+  Role role{Role::Follower};
+
+  uint64_t current_term{0};
+  std::optional<uint64_t> voted_for;
+
+  uint64_t vote_count{0};
+  
+  std::chrono::steady_clock::time_point last_heartbeat;
+
+  std::chrono::milliseconds heartbeat_interval{100};
+  std::chrono::milliseconds election_timeout_min{300};
+  std::chrono::milliseconds election_timeout_max{500};
+
+  std::chrono::milliseconds get_random_election_timeout();
+
 };
 } // namespace rafty
 
