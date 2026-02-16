@@ -69,10 +69,11 @@ void Raft::run() {
 
             logger->info("Node {} starting election for term {}", id, current_term);
 
+            auto term = this->current_term;
+
             // send RequestVote RPCs w/o holding lock
             lock.unlock();
-
-            // TODO: send RequestVote RPCs to all peers
+            this->send_request_votes(term);
             lock.lock();
           }
         }
