@@ -128,6 +128,47 @@ std::chrono::milliseconds Raft::get_random_election_timeout() {
   return std::chrono::milliseconds(min_ms + static_cast<uint64_t>(offset));
 }
 
+void Raft::send_heartbeats(uint64_t term) {
+  for (auto &p: peers) {
+    auto targt_id = p.first;
+    auto &stub = p.second;
+
+    if (!stub) {
+      continue;
+    }
+
+    raftpb::AppendEntriesRequest req;
+    req.set_term(term);
+    req.set_leader_id(id);
+    req.set_prev_log_index(0);
+    req.set_prev_log_term(0);
+    req.set_leader_commit(0);
+
+    auto context = this->create_context(target_id);
+    raftpb::AppendEntriesReply reply;
+
+    grpc::Status status = stub->AppendEntries(context.get(), &req, &reply);
+    if (!status.ok()) {
+      continue;
+    }
+
+    std::lock_guard<std::mutex> lock(this->mtx);
+
+    if (reply.term() > this->current_term) {
+      this->current_term = reply.term();
+      this->role = Role::Follower;
+      this->voted_for.reset();
+    }
+  }
+
+  return;
+}
+
+// TODO: send RequestVote RPCs to all peers
+void Raft::send_request_votes(uint64_t term) {
+  return;
+}
+
 grpc::Status Raft::RaftServiceImpl::AppendEntries(
         grpc::ServerContext *context,
         const raftpb::AppendEntriesRequest *request,
