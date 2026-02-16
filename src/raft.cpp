@@ -67,7 +67,7 @@ void Raft::run() {
             this->last_heartbeat = now;
             election_timeout = get_random_election_timeout();
 
-            logger->info("Node {} starting election for term {}", id, current_term);
+            logger->info("Raft node {} starting election for term {}", id, current_term);
 
             auto term = this->current_term;
 
@@ -167,7 +167,6 @@ void Raft::send_heartbeats(uint64_t term) {
   return;
 }
 
-// TODO: send RequestVote RPCs to all peers
 void Raft::send_request_votes(uint64_t term) {
   return;
 }
