@@ -69,7 +69,7 @@ inline void Raft::connect_peers() {
     auto channel = CreateCustomChannelWithInterceptors(
         peer_addr.second, grpc::InsecureChannelCredentials(), args,
         std::move(interceptor_creators));
-    auto stub = raftpb::RaftService::NewStub(std::move(channel));
+    auto stub = raftpb::RaftService::NewStub(std::move(channel)); // Client Stubs
     peers_[peer_addr.first] = std::move(stub);
   }
 }
