@@ -187,7 +187,7 @@ void Raft::send_request_votes(uint64_t term) {
     auto context = this->create_context(target_id);
     raftpb::RequestVoteReply reply;
 
-    grpc::Status status = stub->RequestVote(context.get(), &req, &reply);
+    grpc::Status status = stub->RequestVote(context.get(), req, &reply);
     if (!status.ok()) {
       continue;
     }
@@ -219,6 +219,7 @@ grpc::Status Raft::RaftServiceImpl::AppendEntries(
       const raftpb::AppendEntriesRequest *request,
       raftpb::AppendEntriesReply *reply){
 
+    (void)context;
     std::lock_guard<std::mutex> lock(raft_->mtx);
 
     //can be stale entry
@@ -249,7 +250,8 @@ grpc::Status Raft::RaftServiceImpl::AppendEntries(
 grpc::Status Raft::RaftServiceImpl::RequestVote(grpc::ServerContext *context,
                         const raftpb::RequestVoteRequest *request,
                         raftpb::RequestVoteReply *reply){
-
+                          
+    (void)context;
     std::lock_guard<std::mutex> lock(raft_->mtx);
     
     // the node requesting vote is stale
