@@ -190,26 +190,27 @@ void Raft::send_request_votes(uint64_t term) {
     grpc::Status status = stub->RequestVote(context.get(), &req, &reply);
     if (!status.ok()) {
       continue;
-  }
+    }
 
-  std::lock_guard<std::mutex> lock(this->mtx);
-  
-  if (reply.term() > this->current_term) {
-    this->current_term = reply.term();
-    this->role = Role::Follower;
-    this->voted_for.reset();
-    this->vote_count = 0;
-    continue;
-  }
+    std::lock_guard<std::mutex> lock(this->mtx);
+    if (reply.term() > this->current_term) {
+      this->current_term = reply.term();
+      this->role = Role::Follower;
+      this->voted_for.reset();
+      this->vote_count = 0;
+      continue;
+    }
 
-  if (this->role == Role::Candidate && this->current_term == term && reply.vote_granted()) {
-    this->vote_count += 1;
-    if (this->vote_count >= majority) {
-      this->role = Role::Leader;
-      logger->info("Raft node {} becomes leader for term {}", id, this->current_term);
+    if (this->role == Role::Candidate && this->current_term == term && reply.vote_granted()) {
+      this->vote_count += 1;
+      
+      if (this->vote_count >= majority) {
+        this->role = Role::Leader;
+        logger->info("Raft node {} becomes leader for term {}", id, this->current_term);
+      }
     }
   }
-
+  
   return;
 }
 
