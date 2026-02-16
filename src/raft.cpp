@@ -175,6 +175,9 @@ grpc::Status Raft::RaftServiceImpl::AppendEntries(
       grpc::ServerContext *context,
       const raftpb::AppendEntriesRequest *request,
       raftpb::AppendEntriesReply *reply){
+
+    std::lock_guard<std::mutex> lock(raft_->mtx);
+
     //can be stale entry
     if(request->term() < raft_->current_term) {
         reply->set_term(raft_->current_term);
@@ -203,6 +206,9 @@ grpc::Status Raft::RaftServiceImpl::AppendEntries(
 grpc::Status Raft::RaftServiceImpl::RequestVote(grpc::ServerContext *context,
                         const raftpb::RequestVoteRequest *request,
                         raftpb::RequestVoteReply *reply){
+
+    std::lock_guard<std::mutex> lock(raft_->mtx);
+    
     // the node requesting vote is stale
     if(request->term() < raft_->current_term){ 
         raft_->logger->info("Raft node {} denying vote to {}", raft_->id, request->candidate_id());
@@ -224,7 +230,7 @@ grpc::Status Raft::RaftServiceImpl::RequestVote(grpc::ServerContext *context,
         return grpc::Status::OK;
     }
     //check candidate log -> skip for now since we don't have log yet
-    
+
     // grant vote
     raft_->voted_for = request->candidate_id();
     raft_->last_heartbeat = std::chrono::steady_clock::now(); // reset election timeout
