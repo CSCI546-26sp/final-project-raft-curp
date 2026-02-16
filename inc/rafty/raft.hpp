@@ -6,6 +6,8 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <chrono>
+#include <optional>
 
 #include <grpcpp/grpcpp.h>
 
@@ -87,6 +89,27 @@ private:
   std::unique_ptr<Server> server_;
 
   std::unique_ptr<RaftServiceImpl> grpcService; // grpc server instance
+
+  // Raft states
+  enum class Role {
+    Follower,
+    Candidate,
+    Leader
+  };
+
+  Role role{Role::Follower};
+
+  uint64_t current_term{0};
+  std::optional<uint64_t> voted_for;
+
+  uint64_t vote_count{0};
+  
+  std::chrono::steady_clock::time_point last_heartbeat;
+
+  std::chrono::milliseconds heartbeat_interval{100};
+  std::chrono::milliseconds election_timeout_min{300};
+  std::chrono::milliseconds election_timeout_max{500};
+
 };
 } // namespace rafty
 

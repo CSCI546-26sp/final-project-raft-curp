@@ -12,11 +12,18 @@ using grpc::experimental::CreateCustomChannelWithInterceptors;
 
 Raft::Raft(const Config &config, MessageQueue<ApplyResult> &ready)
     : logger(utils::logger::get_logger(config.id)), id(config.id), listening_addr(config.addr),
-      peer_addrs(config.peer_addrs), dead(false), ready_queue(ready)
+      peer_addrs(config.peer_addrs), dead(false), ready_queue(ready), grpcService(std::make_unique<RaftServiceImpl>(this))
   // TODO: add more field if desired
 {
   // TODO: finish it
-  grpcService = std::make_unique<RaftServiceImpl>(this); // initialise server instance
+  this->role = Role::Follower;
+  this->current_term = 0;
+  this->voted_for.reset();
+  this->vote_count = 0;
+  this->last_heartbeat = std::chrono::steady_clock::now();
+  this->heartbeat_interval = std::chrono::milliseconds(100);
+  this->election_timeout_min = std::chrono::milliseconds(300);
+  this->election_timeout_max = std::chrono::milliseconds(500);
 }
 
 Raft::~Raft() { this->stop_server(); }
@@ -26,6 +33,7 @@ void Raft::run() {
   // Note: this function should be non-blocking
 
   // lab 1
+  
 }
 
 State Raft::get_state() const {
