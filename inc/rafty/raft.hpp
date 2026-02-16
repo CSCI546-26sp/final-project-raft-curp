@@ -112,6 +112,8 @@ private:
 
   std::chrono::milliseconds get_random_election_timeout();
 
+  void send_heartbeats(uint64_t term);
+  void send_request_votes(uint64_t term);
 };
 } // namespace rafty
 
