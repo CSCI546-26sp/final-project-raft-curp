@@ -48,10 +48,11 @@ void Raft::run() {
           if (now >= next_heartbeat) {
             next_heartbeat = now + heartbeat_interval;
 
+            auto term = this->current_term;
+
             // send heartbeats w/o holding lock
             lock.unlock();
-            
-            // TODO: send AppendEntries (heartbeat) RPCs to all peers
+            this->send_heartbeats(term);
             lock.lock();
           }
         } else {
