@@ -114,7 +114,6 @@ ProposalResult Raft::propose_sync(const std::string &data) {
 }
 
 // TODO: add more functions if desired.
-
 std::chrono::milliseconds Raft::get_random_election_timeout() {
   auto min_ms = election_timeout_min.count();
   auto max_ms = election_timeout_max.count();
@@ -168,6 +167,49 @@ void Raft::send_heartbeats(uint64_t term) { // DOUBT: maybe we need to make it p
 }
 
 void Raft::send_request_votes(uint64_t term) {
+  size_t total_nodes = peer_addrs.size() + 1;
+  size_t majority = total_nodes / 2 + 1;
+
+  for (auto &p: peers_) {
+    auto target_id = p.first;
+    auto &stub = p.second;
+    
+    if (!stub) {
+      continue;
+    }
+
+    raftpb::RequestVoteRequest req;
+    req.set_term(term);
+    req.set_candidate_id(id);
+    req.set_last_log_index(0);
+    req.set_last_log_term(0);
+
+    auto context = this->create_context(target_id);
+    raftpb::RequestVoteReply reply;
+
+    grpc::Status status = stub->RequestVote(context.get(), &req, &reply);
+    if (!status.ok()) {
+      continue;
+  }
+
+  std::lock_guard<std::mutex> lock(this->mtx);
+  
+  if (reply.term() > this->current_term) {
+    this->current_term = reply.term();
+    this->role = Role::Follower;
+    this->voted_for.reset();
+    this->vote_count = 0;
+    continue;
+  }
+
+  if (this->role == Role::Candidate && this->current_term == term && reply.vote_granted()) {
+    this->vote_count += 1;
+    if (this->vote_count >= majority) {
+      this->role = Role::Leader;
+      logger->info("Raft node {} becomes leader for term {}", id, this->current_term);
+    }
+  }
+
   return;
 }
 
