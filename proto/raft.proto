@@ -4,8 +4,8 @@ package raftpb;
 
 service RaftService {
   // TODO: implement AppendEntries and RequestVote
-  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse) {}
-  rpc RequestVote (RequestVoteResponse) returns (RequestVoteResponse) {}
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesReply) {}
+  rpc RequestVote (RequestVoteRequest) returns (RequestVoteReply) {}
 }
 
 message Entry{
@@ -23,7 +23,7 @@ message AppendEntriesRequest{
   uint64 leader_commit = 6;
 }
 
-message AppendEntriesResponse{
+message AppendEntriesReply{
   uint64 term = 1;
   bool success = 2;
 }
@@ -35,7 +35,7 @@ message RequestVoteRequest{
   uint64 last_log_term = 4;
 }
 
-message RequestVoteResponse{
+message RequestVoteReply{
   uint64 term = 1;
   bool vote_granted = 2;
 }

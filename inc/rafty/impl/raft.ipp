@@ -29,7 +29,7 @@ inline void Raft::start_server() {
 
   // TODO: implement RaftService RPC
   // and register the service.
-  builder.RegisterService(nullptr); /* replace nullptr with actual gRPC service */
+  builder.RegisterService(grpcService.get()); /* replace nullptr with actual gRPC service */
 
   std::unique_ptr<Server> server(builder.BuildAndStart());
   logger->info("Raft server {} listening on {}", id, listening_addr);

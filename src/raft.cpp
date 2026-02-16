@@ -16,6 +16,7 @@ Raft::Raft(const Config &config, MessageQueue<ApplyResult> &ready)
   // TODO: add more field if desired
 {
   // TODO: finish it
+  grpcService = std::make_unique<RaftServiceImpl>(this); // initialise server instance
 }
 
 Raft::~Raft() { this->stop_server(); }
@@ -40,5 +41,18 @@ ProposalResult Raft::propose_sync(const std::string &data) {
 }
 
 // TODO: add more functions if desired.
+
+grpc::Status Raft::RaftServiceImpl::AppendEntries(
+        grpc::ServerContext *context,
+        const raftpb::AppendEntriesRequest *request,
+        raftpb::AppendEntriesReply *reply){
+    return grpc::Status::OK;
+}
+
+grpc::Status Raft::RaftServiceImpl::RequestVote(grpc::ServerContext *context,
+                        const raftpb::RequestVoteRequest *request,
+                        raftpb::RequestVoteReply *reply){
+    return grpc::Status::OK;
+}
 
 } // namespace rafty

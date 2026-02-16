@@ -53,6 +53,20 @@ private:
   std::unique_ptr<grpc::ClientContext> create_context(uint64_t to) const;
   void apply(const ApplyResult &result);
 
+  class RaftServiceImpl final : public raftpb::RaftService::Service {
+    public:
+      explicit RaftServiceImpl(Raft *raft) : raft_(raft) {}
+      grpc::Status RequestVote(grpc::ServerContext *context,
+                              const raftpb::RequestVoteRequest *request,
+                              raftpb::RequestVoteReply *reply) override;
+      grpc::Status AppendEntries(
+          grpc::ServerContext *context, const raftpb::AppendEntriesRequest *request,
+          raftpb::AppendEntriesReply *reply) override;
+
+    private:
+      Raft *raft_;
+  };
+
 protected:
   // WARN: do not modify `mtx` and `logger`.
   mutable std::mutex mtx;
@@ -71,6 +85,8 @@ private:
 
   std::unordered_map<uint64_t, RaftServiceStub> peers_;
   std::unique_ptr<Server> server_;
+
+  std::unique_ptr<RaftServiceImpl> grpcService; // grpc server instance
 };
 } // namespace rafty
 
