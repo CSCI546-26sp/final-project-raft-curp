@@ -130,7 +130,7 @@ std::chrono::milliseconds Raft::get_random_election_timeout() {
   return std::chrono::milliseconds(min_ms + static_cast<uint64_t>(offset));
 }
 
-void Raft::send_heartbeats(uint64_t term) {
+void Raft::send_heartbeats(uint64_t term) { // DOUBT: maybe we need to make it parallel? is sequential sending fine?
   for (auto &p: peers_) {
     auto target_id = p.first;
     auto &stub = p.second;
@@ -156,7 +156,7 @@ void Raft::send_heartbeats(uint64_t term) {
 
     std::lock_guard<std::mutex> lock(this->mtx);
 
-    if (reply.term() > this->current_term) {
+    if (reply.term() > this->current_term) { // DOUBT: do we need to set that this received heartbeat here? I mean update last_heartbeat?
       this->current_term = reply.term();
       this->role = Role::Follower;
       this->voted_for.reset();
@@ -172,15 +172,65 @@ void Raft::send_request_votes(uint64_t term) {
 }
 
 grpc::Status Raft::RaftServiceImpl::AppendEntries(
-        grpc::ServerContext *context,
-        const raftpb::AppendEntriesRequest *request,
-        raftpb::AppendEntriesReply *reply){
+      grpc::ServerContext *context,
+      const raftpb::AppendEntriesRequest *request,
+      raftpb::AppendEntriesReply *reply){
+    //can be stale entry
+    if(request->term() < raft_->current_term) {
+        reply->set_term(raft_->current_term);
+        reply->set_success(false);
+        return grpc::Status::OK;
+    }
+    // heartbeat and need to update ourself
+    else if(request->term() > raft_->current_term) {
+        raft_->current_term = request->term(); // update the current term and become follower
+        raft_->role = Role::Follower;
+        raft_->voted_for.reset();
+        raft_->logger->info("Raft node {} received heartbeat from leader {} and becoming follower", raft_->id, request->leader_id());
+    }
+    // heartbeat
+    else if(request->term() == raft_->current_term) {
+        raft_->role = Role::Follower; // if we are candidate then move to follower
+        raft_->logger->info("Raft node {} received heartbeat from leader {}", raft_->id, request->leader_id());
+    }
+    raft_->last_heartbeat = std::chrono::steady_clock::now();
+
+    reply->set_term(raft_->current_term);
+    reply->set_success(true);
     return grpc::Status::OK;
 }
 
 grpc::Status Raft::RaftServiceImpl::RequestVote(grpc::ServerContext *context,
                         const raftpb::RequestVoteRequest *request,
                         raftpb::RequestVoteReply *reply){
+    // the node requesting vote is stale
+    if(request->term() < raft_->current_term){ 
+        raft_->logger->info("Raft node {} denying vote to {}", raft_->id, request->candidate_id());
+        reply->set_term(raft_->current_term);
+        reply->set_vote_granted(false);
+        return grpc::Status::OK;
+    }
+    else if(request->term() > raft_->current_term){ // the node requesting vote is in higher term, we should update our term and reset vote
+        raft_->current_term = request->term();
+        raft_->voted_for.reset();
+        raft_->role = Role::Follower;
+    }
+
+    // if we have already voted for someone else in this term, deny vote
+    if(raft_->voted_for.has_value() && raft_->voted_for.value() != request->candidate_id()){
+        raft_->logger->info("Raft node {} denying vote to {}", raft_->id, request->candidate_id());
+        reply->set_term(raft_->current_term);
+        reply->set_vote_granted(false);
+        return grpc::Status::OK;
+    }
+    //check candidate log -> skip for now since we don't have log yet
+    
+    // grant vote
+    raft_->voted_for = request->candidate_id();
+    raft_->last_heartbeat = std::chrono::steady_clock::now(); // reset election timeout
+    raft_->logger->info("Raft node {} granting vote to {}", raft_->id, request->candidate_id());
+    reply->set_term(raft_->current_term);
+    reply->set_vote_granted(true);
     return grpc::Status::OK;
 }
 
