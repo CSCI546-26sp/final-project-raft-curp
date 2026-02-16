@@ -110,6 +110,8 @@ private:
   std::chrono::milliseconds election_timeout_min{300};
   std::chrono::milliseconds election_timeout_max{500};
 
+  std::chrono::milliseconds get_random_election_timeout();
+
 };
 } // namespace rafty
 

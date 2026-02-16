@@ -33,22 +33,100 @@ void Raft::run() {
   // Note: this function should be non-blocking
 
   // lab 1
-  
+  std::thread([this]() {
+    logger->info("Raft node {} run loop started", id);
+
+    auto next_heartbeat = std::chrono::steady_clock::now() + heartbeat_interval;
+    auto election_timeout = get_random_election_timeout();
+
+    while (!this->is_dead()) {
+      {
+        std::unique_lock<std::mutex> lock(this->mtx);
+        auto now = std::chrono::steady_clock::now();
+
+        if (this->role == Role::Leader) {
+          if (now >= next_heartbeat) {
+            next_heartbeat = now + heartbeat_interval;
+
+            // send heartbeats w/o holding lock
+            lock.unlock();
+            
+            // TODO: send AppendEntries (heartbeat) RPCs to all peers
+            lock.lock();
+          }
+        } else {
+          auto elapsed = now - last_heartbeat;
+
+          if (elapsed >= election_timeout) {
+            // election timeout, start new election
+            this->current_term += 1;
+            this->role = Role::Candidate;
+            this->voted_for = this->id;
+            this->vote_count = 1;
+            this->last_heartbeat = now;
+            election_timeout = get_random_election_timeout();
+
+            logger->info("Node {} starting election for term {}", id, current_term);
+
+            // send RequestVote RPCs w/o holding lock
+            lock.unlock();
+
+            // TODO: send RequestVote RPCs to all peers
+            lock.lock();
+          }
+        }
+      }
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    
+    logger->info("Raft node {} run loop exit", id);
+  }).detach();
 }
 
 State Raft::get_state() const {
   // TODO: lab 1
+  std::lock_guard<std::mutex> lock(this->mtx);
+  State s;
+  s.term = this->current_term;
+  s.is_leader = (this->role == Role::Leader);
+  return s;
 }
 
 ProposalResult Raft::propose(const std::string &data) {
   // TODO: lab 2
+  (void) data; // silencing unused warning for now
+
+  std::lock_guard<std::mutex> lock(this->mtx);
+
+  ProposalResult res;
+  res.index = 0; // dummy index for now
+  res.term = this->current_term; // whatever term we are on
+  res.is_leader = (this->role == Role::Leader);
+  return res;
 }
 
 ProposalResult Raft::propose_sync(const std::string &data) {
   // TODO: lab 3
+  return propose(data);
 }
 
 // TODO: add more functions if desired.
+
+std::chrono::milliseconds Raft::get_random_election_timeout() {
+  auto min_ms = election_timeout_min.count();
+  auto max_ms = election_timeout_max.count();
+
+  if (max_ms <= min_ms) {
+    return election_timeout_min;
+  }
+
+  auto range = static_cast<uint64_t>(max_ms - min_ms + 1);
+  auto &gen = utils::RandGen::get_instance();
+  auto offset = gen.intn(range);
+
+  return std::chrono::milliseconds(min_ms + static_cast<uint64_t>(offset));
+}
 
 grpc::Status Raft::RaftServiceImpl::AppendEntries(
         grpc::ServerContext *context,
