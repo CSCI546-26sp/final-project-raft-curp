@@ -36,7 +36,7 @@ inline void Raft::start_server() {
 
   this->server_ = std::move(server);
 
-  std::thread([this] { this->server_->Wait(); }).detach();
+  std::thread([this] { this->server_->Wait(); }).detach(); // listens to incoming RPC requests
 }
 
 inline void Raft::stop_server() {

@@ -45,7 +45,7 @@ void Raft::run() {
         auto now = std::chrono::steady_clock::now();
 
         if (this->role == Role::Leader) {
-          if (now >= next_heartbeat) {
+          if (now >= next_heartbeat) {   // is this correct? or should we check the elapsed time since last heartbeat?
             next_heartbeat = now + heartbeat_interval;
 
             auto term = this->current_term;
@@ -131,8 +131,8 @@ std::chrono::milliseconds Raft::get_random_election_timeout() {
 }
 
 void Raft::send_heartbeats(uint64_t term) {
-  for (auto &p: peers) {
-    auto targt_id = p.first;
+  for (auto &p: peers_) {
+    auto target_id = p.first;
     auto &stub = p.second;
 
     if (!stub) {
@@ -149,7 +149,7 @@ void Raft::send_heartbeats(uint64_t term) {
     auto context = this->create_context(target_id);
     raftpb::AppendEntriesReply reply;
 
-    grpc::Status status = stub->AppendEntries(context.get(), &req, &reply);
+    grpc::Status status = stub->AppendEntries(context.get(), req, &reply);
     if (!status.ok()) {
       continue;
     }
@@ -160,6 +160,7 @@ void Raft::send_heartbeats(uint64_t term) {
       this->current_term = reply.term();
       this->role = Role::Follower;
       this->voted_for.reset();
+      logger->info("Raft node {} stepping down", id);
     }
   }
 
