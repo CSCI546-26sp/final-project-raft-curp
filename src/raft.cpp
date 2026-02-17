@@ -159,6 +159,7 @@ void Raft::send_heartbeats(uint64_t term) { // DOUBT: maybe we need to make it p
       this->current_term = reply.term();
       this->role = Role::Follower;
       this->voted_for.reset();
+      this->last_heartbeat = std::chrono::steady_clock::now();
       logger->info("Raft node {} stepping down", id);
     }
   }
@@ -198,6 +199,7 @@ void Raft::send_request_votes(uint64_t term) {
       this->role = Role::Follower;
       this->voted_for.reset();
       this->vote_count = 0;
+      this->last_heartbeat = std::chrono::steady_clock::now();
       continue;
     }
 
