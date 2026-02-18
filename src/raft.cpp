@@ -137,7 +137,8 @@ void Raft::send_heartbeats(uint64_t term) {
       continue;
     }
 
-    std::thread([this, term, target_id, stub]() {
+    std::thread([this, term, target_id]() {
+      auto& stub = this->peers_[target_id];
       raftpb::AppendEntriesRequest req;
       req.set_term(term);
       req.set_leader_id(id);
