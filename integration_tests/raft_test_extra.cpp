@@ -170,6 +170,65 @@ TEST_F(RaftTest, ExampleTestA) {
   }
 }
 
+TEST_F(RaftTest, 2159570081_StrictNoReelectionOnReconnectA) {
+  this->init_logger("YOURUSCID_StrictNoReelectionOnReconnectA");
+  auto servers = 3;
+  auto local_confs = toolings::ConfigGen::gen_local_instances(servers, 50051);
+  auto r_confs = toolings::ConfigGen::gen_raft_configs(local_confs);
+  toolings::MultiprocTestConfig cfg(r_confs, NODE_APP_PATH, this->logger,
+                                    ddb_conf, 0, this->raft_node_verb);
+
+  try {
+    cfg.begin();
+
+    auto leader1 = cfg.check_one_leader();
+    EXPECT_TRUE(leader1.has_value()) << "No leader found!";
+    auto term1 = cfg.check_terms(); 
+    EXPECT_TRUE(term1.has_value()) << "Failed to get initial term";
+
+    logger->info("Disconnect leader - force reelection");
+    cfg.disconnect(*leader1);
+    cfg.check_one_leader();
+    logger->info("Disconnect leader finished - should done election.");
+
+    logger->info("Reconnect leader - should have no reelection");
+    auto term2 = cfg.check_terms();
+    EXPECT_TRUE(term2.has_value()) << "Failed to get term before reconnect";
+    
+    cfg.reconnect(*leader1);
+    auto leader2 = cfg.check_one_leader();
+    EXPECT_TRUE(leader2.has_value()) << "No leader found!";
+    
+    auto term3 = cfg.check_terms(); 
+    EXPECT_TRUE(term3.has_value()) << "Failed to get term after reconnect";
+    
+    ASSERT_EQ(*term2, *term3) 
+        << "Term changed after reconnect: " << *term2 << " -> " << *term3
+        << ". Unnecessary re-election detected!";
+    
+    logger->info("Reconnect leader finished - should have no election.");
+
+    logger->info("Disconnect two servers - should have no leader.");
+    cfg.disconnect((*leader2 + 1) % servers);
+    cfg.disconnect(*leader2);
+    std::this_thread::sleep_for(2 * TIMEOUT);
+    cfg.check_no_leader();
+    logger->info("Disconnect two servers finished - should have no leader.");
+
+    logger->info("Reconnect two servers - should trigger one election.");
+    cfg.reconnect((*leader2 + 1) % servers);
+    cfg.check_one_leader();
+    logger->info(
+        "Reconnect two servers finished - should trigger one election.");
+
+    cfg.reconnect(*leader2);
+    cfg.check_one_leader();
+  } catch (const std::exception &e) {
+    logger->error("Exception: {}", e.what());
+    FAIL() << "Exception: " << e.what();
+  }
+}
+
 static pid_t pgid = 0;
 
 void signal_handler(int signal) {
