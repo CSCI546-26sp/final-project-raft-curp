@@ -176,7 +176,8 @@ void Raft::send_request_votes(uint64_t term) {
       continue;
     }
 
-    std::thread([this, term, target_id, stub, majority]() {
+    std::thread([this, term, target_id, majority]() {
+      auto& stub = this->peers_[target_id];
       raftpb::RequestVoteRequest req;
       req.set_term(term);
       req.set_candidate_id(id);
