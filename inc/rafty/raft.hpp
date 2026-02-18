@@ -106,9 +106,9 @@ private:
   
   std::chrono::steady_clock::time_point last_heartbeat;
 
-  std::chrono::milliseconds heartbeat_interval{100};
-  std::chrono::milliseconds election_timeout_min{300};
-  std::chrono::milliseconds election_timeout_max{500};
+  std::chrono::milliseconds heartbeat_interval{50};
+  std::chrono::milliseconds election_timeout_min{150};
+  std::chrono::milliseconds election_timeout_max{300};
 
   std::chrono::milliseconds get_random_election_timeout();
 

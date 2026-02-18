@@ -21,9 +21,9 @@ Raft::Raft(const Config &config, MessageQueue<ApplyResult> &ready)
   this->voted_for.reset();
   this->vote_count = 0;
   this->last_heartbeat = std::chrono::steady_clock::now();
-  this->heartbeat_interval = std::chrono::milliseconds(100);
-  this->election_timeout_min = std::chrono::milliseconds(300);
-  this->election_timeout_max = std::chrono::milliseconds(500);
+  this->heartbeat_interval = std::chrono::milliseconds(50);
+  this->election_timeout_min = std::chrono::milliseconds(150);
+  this->election_timeout_max = std::chrono::milliseconds(300);
 }
 
 Raft::~Raft() { this->stop_server(); }
@@ -129,91 +129,88 @@ std::chrono::milliseconds Raft::get_random_election_timeout() {
   return std::chrono::milliseconds(min_ms + static_cast<uint64_t>(offset));
 }
 
-void Raft::send_heartbeats(uint64_t term) { // DOUBT: maybe we need to make it parallel? is sequential sending fine?
-  for (auto &p: peers_) {
-    auto target_id = p.first;
-    auto &stub = p.second;
-
+void Raft::send_heartbeats(uint64_t term) {
+  for (auto &p : peers_) {
+    uint64_t target_id = p.first;
+    auto *stub = p.second.get();
     if (!stub) {
       continue;
     }
 
-    raftpb::AppendEntriesRequest req;
-    req.set_term(term);
-    req.set_leader_id(id);
-    req.set_prev_log_index(0);
-    req.set_prev_log_term(0);
-    req.set_leader_commit(0);
+    std::thread([this, term, target_id, stub]() {
+      raftpb::AppendEntriesRequest req;
+      req.set_term(term);
+      req.set_leader_id(id);
+      req.set_prev_log_index(0);
+      req.set_prev_log_term(0);
+      req.set_leader_commit(0);
 
-    auto context = this->create_context(target_id);
-    raftpb::AppendEntriesReply reply;
+      auto context = this->create_context(target_id);
+      raftpb::AppendEntriesReply reply;
 
-    grpc::Status status = stub->AppendEntries(context.get(), req, &reply);
-    if (!status.ok()) {
-      continue;
-    }
+      grpc::Status status = stub->AppendEntries(context.get(), req, &reply);
+      if (!status.ok()) {
+        return;
+      }
 
-    std::lock_guard<std::mutex> lock(this->mtx);
-
-    if (reply.term() > this->current_term) { // DOUBT: do we need to set that this received heartbeat here? I mean update last_heartbeat?
-      this->current_term = reply.term();
-      this->role = Role::Follower;
-      this->voted_for.reset();
-      this->last_heartbeat = std::chrono::steady_clock::now();
-      logger->info("Raft node {} stepping down", id);
-    }
+      std::lock_guard<std::mutex> lock(this->mtx);
+      if (reply.term() > this->current_term) {
+        this->current_term = reply.term();
+        this->role = Role::Follower;
+        this->voted_for.reset();
+        this->last_heartbeat = std::chrono::steady_clock::now();
+        logger->info("Raft node {} stepping down", id);
+      }
+    }).detach();
   }
-
-  return;
 }
 
 void Raft::send_request_votes(uint64_t term) {
   size_t total_nodes = peer_addrs.size() + 1;
   size_t majority = total_nodes / 2 + 1;
 
-  for (auto &p: peers_) {
-    auto target_id = p.first;
-    auto &stub = p.second;
-    
+  for (auto &p : peers_) {
+    uint64_t target_id = p.first;
+    auto *stub = p.second.get();
     if (!stub) {
       continue;
     }
 
-    raftpb::RequestVoteRequest req;
-    req.set_term(term);
-    req.set_candidate_id(id);
-    req.set_last_log_index(0);
-    req.set_last_log_term(0);
+    std::thread([this, term, target_id, stub, majority]() {
+      raftpb::RequestVoteRequest req;
+      req.set_term(term);
+      req.set_candidate_id(id);
+      req.set_last_log_index(0);
+      req.set_last_log_term(0);
 
-    auto context = this->create_context(target_id);
-    raftpb::RequestVoteReply reply;
+      auto context = this->create_context(target_id);
+      raftpb::RequestVoteReply reply;
 
-    grpc::Status status = stub->RequestVote(context.get(), req, &reply);
-    if (!status.ok()) {
-      continue;
-    }
-
-    std::lock_guard<std::mutex> lock(this->mtx);
-    if (reply.term() > this->current_term) {
-      this->current_term = reply.term();
-      this->role = Role::Follower;
-      this->voted_for.reset();
-      this->vote_count = 0;
-      this->last_heartbeat = std::chrono::steady_clock::now();
-      continue;
-    }
-
-    if (this->role == Role::Candidate && this->current_term == term && reply.vote_granted()) {
-      this->vote_count += 1;
-      
-      if (this->vote_count >= majority) {
-        this->role = Role::Leader;
-        logger->info("Raft node {} becomes leader for term {}", id, this->current_term);
+      grpc::Status status = stub->RequestVote(context.get(), req, &reply);
+      if (!status.ok()) {
+        return;
       }
-    }
+
+      std::lock_guard<std::mutex> lock(this->mtx);
+      if (reply.term() > this->current_term) {
+        this->current_term = reply.term();
+        this->role = Role::Follower;
+        this->voted_for.reset();
+        this->vote_count = 0;
+        this->last_heartbeat = std::chrono::steady_clock::now();
+        return;
+      }
+      if (this->role == Role::Candidate && this->current_term == term &&
+          reply.vote_granted()) {
+        this->vote_count += 1;
+        if (this->vote_count >= majority) {
+          this->role = Role::Leader;
+          logger->info("Raft node {} becomes leader for term {}", id,
+                       this->current_term);
+        }
+      }
+    }).detach();
   }
-  
-  return;
 }
 
 grpc::Status Raft::RaftServiceImpl::AppendEntries(
