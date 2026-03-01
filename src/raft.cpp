@@ -188,8 +188,8 @@ void Raft::send_request_votes(uint64_t term) {
       raftpb::RequestVoteRequest req;
       req.set_term(term);
       req.set_candidate_id(id);
-      req.set_last_log_index(0);
-      req.set_last_log_term(0);
+      req.set_last_log_index(this->log_entries.size() - 1); // last log index (0-based)
+      req.set_last_log_term(this->log_entries.back().term()); // last log term
 
       auto context = this->create_context(target_id);
       raftpb::RequestVoteReply reply;
@@ -282,6 +282,18 @@ grpc::Status Raft::RaftServiceImpl::RequestVote(grpc::ServerContext *context,
         return grpc::Status::OK;
     }
     //check candidate log -> skip for now since we don't have log yet
+    uint64_t my_last_index = raft_->log_entries.size() - 1;
+    uint64_t my_last_term = raft_->log_entries.back().term();
+
+    bool candidate_log_up_to_date = (request->last_log_term() > my_last_term) ||
+                        (request->last_log_term() == my_last_term && request->last_log_index() >= my_last_index);  
+
+    if(!candidate_log_up_to_date){
+        raft_->logger->info("Raft node {} denying vote to {} due to log not up-to-date", raft_->id, request->candidate_id());
+        reply->set_term(raft_->current_term);
+        reply->set_vote_granted(false);
+        return grpc::Status::OK;
+    }
 
     // grant vote
     raft_->voted_for = request->candidate_id();
