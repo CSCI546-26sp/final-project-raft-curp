@@ -24,6 +24,12 @@ Raft::Raft(const Config &config, MessageQueue<ApplyResult> &ready)
   this->heartbeat_interval = std::chrono::milliseconds(50);
   this->election_timeout_min = std::chrono::milliseconds(150);
   this->election_timeout_max = std::chrono::milliseconds(300);
+  // initiliaze log with dummy entry at index 0
+  raftpb::Entry dummy_entry;
+  dummy_entry.set_term(0);
+  dummy_entry.set_index(0);
+  dummy_entry.set_command("");
+  this->log_entries.push_back(dummy_entry); // index 0 is dummy entry
 }
 
 Raft::~Raft() { this->stop_server(); }

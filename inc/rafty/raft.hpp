@@ -110,6 +110,14 @@ private:
   std::chrono::milliseconds election_timeout_min{150};
   std::chrono::milliseconds election_timeout_max{300};
 
+  std::vector<raftpb::Entry> log_entries; // for log entries (index 0 is dummy entry, real entries start from index 1)
+
+  uint64_t commit_index{0};
+  uint64_t last_applied{0};
+
+  std::unordered_map<uint64_t, uint64_t> next_index; // for each server, the next log index to send
+  std::unordered_map<uint64_t, uint64_t> match_index; // for each server, the highest log index known to be replicated
+
   std::chrono::milliseconds get_random_election_timeout();
 
   void send_heartbeats(uint64_t term);
