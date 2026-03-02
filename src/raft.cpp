@@ -120,6 +120,10 @@ ProposalResult Raft::propose(const std::string &data) {
   new_entry.set_command(data);
   this->log_entries.push_back(new_entry);
 
+  // update leader's own indices for the new entry
+  this->match_index[id] = new_entry.index();
+  this->next_index[id] = new_entry.index() + 1;
+
   res.index = new_entry.index();
 
   logger->info("Raft node {} proposed entry at index {} term {}", 
@@ -246,9 +250,18 @@ void Raft::send_request_votes(uint64_t term) {
           this->role = Role::Leader;
           logger->info("Raft node {} becomes leader for term {}", id,
                        this->current_term);
+
+          uint64_t last_idx = this->log_entries.size() - 1;
+
+          // self
+          this->match_index[id] = last_idx;
+          this->next_index[id] = last_idx + 1;
+
+          // peers
           for(auto &p: peers_) {
-            this->next_index[p.first] = this->log_entries.size();
-            this->match_index[p.first] = 0;
+            uint64_t peer_id = p.first;
+            this->next_index[peer_id] = last_idx + 1;
+            this->match_index[peer_id] = 0;
             //this->send_heartbeats(this->current_term); // send initial heartbeats immediately after becoming leader
           }
         }
