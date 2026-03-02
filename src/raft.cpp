@@ -163,7 +163,18 @@ void Raft::send_heartbeats(uint64_t term) {
 
     std::unique_lock<std::mutex> lock(this->mtx);
 
+    if (!this->next_index.count(target_id)) {
+      // default: next index starts at end of log (1-based, dummy at 0)
+      this->next_index[target_id] = this->log_entries.size();
+    }
+
     uint64_t next_idx = this->next_index[target_id];
+    if (next_idx < 1) {
+      next_idx = 1;
+    }
+    if (next_idx > this->log_entries.size()) {
+      next_idx = this->log_entries.size();
+    }
     uint64_t prev_log_index = next_idx - 1;
     uint64_t prev_log_term = this->log_entries[prev_log_index].term();
     uint64_t leader_commit = this->commit_index;
@@ -173,10 +184,9 @@ void Raft::send_heartbeats(uint64_t term) {
             this->log_entries.end()
         );
 
-
     lock.unlock();
 
-    std::thread([this, term, target_id, prev_log_index, prev_log_term, leader_commit]() {
+    std::thread([this, term, target_id, prev_log_index, prev_log_term, leader_commit, entries_to_send]() {
       auto& stub = this->peers_[target_id];
       raftpb::AppendEntriesRequest req;
       req.set_term(term);
@@ -184,6 +194,14 @@ void Raft::send_heartbeats(uint64_t term) {
       req.set_prev_log_index(prev_log_index);
       req.set_prev_log_term(prev_log_term);
       req.set_leader_commit(leader_commit);
+
+      // add log entries to replicate (empty for pure heartbeat)
+      for (const auto &e : entries_to_send) {
+        auto *added = req.add_entries();
+        added->set_term(e.term());
+        added->set_index(e.index());
+        added->set_command(e.command());
+      }
 
       auto context = this->create_context(target_id);
       raftpb::AppendEntriesReply reply;
@@ -194,6 +212,10 @@ void Raft::send_heartbeats(uint64_t term) {
       }
 
       std::lock_guard<std::mutex> lock(this->mtx);
+      if (this->role != Role::Leader || this->current_term != term) {
+        return;
+      }
+      
       if (reply.term() > this->current_term) {
         this->current_term = reply.term();
         this->role = Role::Follower;
@@ -202,7 +224,68 @@ void Raft::send_heartbeats(uint64_t term) {
         logger->info("Raft node {} stepping down", id);
       }
 
-      // TODO: need to add handling of reply
+      // reply handling
+      if (reply.success()) {
+        // all entries sent upto last idx replicated on follower
+        uint64_t last_sent = prev_log_index + static_cast<uint64_t>(entries_to_send.size());
+        this->next_index[target_id] = last_sent + 1;
+        this->match_index[target_id] = last_sent; 
+
+        logger->info("Raft node {} replicated log entries upto index {} on follower {}", 
+          id, last_sent, target_id);
+
+        // try to advance commit_index
+        uint64_t last_idx = this->log_entries.size() - 1;
+        size_t total_nodes = peer_addrs.size() + 1;
+        size_t majority = total_nodes / 2 + 1;
+
+        for (uint64_t N=this->commit_index+1; N<=last_idx; ++N) {
+          size_t count = 0;
+
+          // count leader itself
+          auto self_it = this->match_index.find(this->id);
+          if (self_it != this->match_index.end() && self_it->second >= N) {
+            ++count;
+          }
+
+          // count followers
+          for (const auto &kv: this->match_index) {
+            if (kv.first == this->id) {
+              continue;
+            }
+            if (kv.second >= N) {
+              ++count;
+            }
+          }
+
+          if (count >= majority && this->log_entries[N].term() == this->current_term) {
+            this->commit_index = N;
+            logger->info("Raft node {} advanced commit_index to {}", id, N);
+          }
+        }
+
+        // apply newly committed entries
+        while (this->last_applied < this->commit_index) {
+          this->last_applied += 1;
+          const auto &e = this->log_entries[this->last_applied];
+
+          ApplyResult result;
+          result.valid = true;
+          result.data = e.command();
+          result.index = e.index();
+          this->apply(result);
+          logger->info("Raft node {} applied committed entry index {} term {}", 
+            id, e.index(), e.term());
+        }
+      } else {
+        // backoff, move next_index one step back
+        auto it = this->next_index.find(target_id);
+        if (it != this->next_index.end() && it->second > 1) {
+          it->second -= 1;
+          logger->info("Raft node {} backing off next_index for follower {} to {}", 
+            id, target_id, it->second);
+        }
+      }
     }).detach();
   }
 }
