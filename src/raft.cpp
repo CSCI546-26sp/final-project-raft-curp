@@ -157,14 +157,29 @@ void Raft::send_heartbeats(uint64_t term) {
       continue;
     }
 
-    std::thread([this, term, target_id]() {
+    std::unique_lock<std::mutex> lock(this->mtx);
+
+    uint64_t next_idx = this->next_index[target_id];
+    uint64_t prev_log_index = next_idx - 1;
+    uint64_t prev_log_term = this->log_entries[prev_log_index].term();
+    uint64_t leader_commit = this->commit_index;
+
+    std::vector<raftpb::Entry> entries_to_send(
+            this->log_entries.begin() + next_idx,
+            this->log_entries.end()
+        );
+
+
+    lock.unlock();
+
+    std::thread([this, term, target_id, prev_log_index, prev_log_term, leader_commit]() {
       auto& stub = this->peers_[target_id];
       raftpb::AppendEntriesRequest req;
       req.set_term(term);
-      req.set_leader_id(id);
-      req.set_prev_log_index(0);
-      req.set_prev_log_term(0);
-      req.set_leader_commit(0);
+      req.set_leader_id(this->id);
+      req.set_prev_log_index(prev_log_index);
+      req.set_prev_log_term(prev_log_term);
+      req.set_leader_commit(leader_commit);
 
       auto context = this->create_context(target_id);
       raftpb::AppendEntriesReply reply;
@@ -182,6 +197,8 @@ void Raft::send_heartbeats(uint64_t term) {
         this->last_heartbeat = std::chrono::steady_clock::now();
         logger->info("Raft node {} stepping down", id);
       }
+
+      // TODO: need to add handling of reply
     }).detach();
   }
 }
