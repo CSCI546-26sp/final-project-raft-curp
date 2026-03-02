@@ -298,6 +298,76 @@ grpc::Status Raft::RaftServiceImpl::AppendEntries(
     }
     raft_->last_heartbeat = std::chrono::steady_clock::now();
 
+    // helper lambda() to get last log index (0 is dummy)
+    auto last_log_index = [&]() -> uint64_t {
+      return raft_->log_entries.size() > 0 ? static_cast<uint64_t>(raft_->log_entries.size() - 1) : 0;
+    };
+
+    // 1. log consistency check
+    uint64_t prev_index = request->prev_log_index();
+    uint64_t prev_term = request->prev_log_term();
+
+    if (prev_index > last_log_index()) { // if we are missing entry at prev_index, reject
+      raft_->logger->info("Raft node {} rejecting AppendEntries due to missing entry at index {} (last log index: {})", 
+        raft_->id, prev_index, last_log_index());
+      reply->set_term(raft_->current_term);
+      reply->set_success(false);
+      return grpc::Status::OK;
+    }
+
+    if (prev_index > 0) { // if prev_index > 0, check that term matches
+      const auto &prev_entry = raft_->log_entries[prev_index];
+      if (prev_entry.term() != prev_term) {
+        raft_->logger->info("Raft node {} rejecting AppendEntries due to term mismatch at index {} (expected {}, got {}) (last log index: {})", 
+          raft_->id, prev_index, prev_term, prev_entry.term(), last_log_index());
+        reply->set_term(raft_->current_term);
+        reply->set_success(false);
+        return grpc::Status::OK;
+      }
+    }
+
+    // 2. append/overwrite log entries from leader
+    uint64_t insert_index = prev_index + 1;
+    for (int i=0; i<request->entries_size(); ++i, ++insert_index) {
+      const auto &incoming = request->entries(i);
+
+      if (insert_index < raft_->log_entries.size()) { // delete entry if we already have it with different term
+        if (raft_->log_entries[insert_index].term() != incoming.term()) {
+          raft_->log_entries.erase(raft_->log_entries.begin() + static_cast<std::ptrdiff_t>(insert_index), raft_->log_entries.end());
+        } else {
+          continue; // same term & idx already matches, skip
+        }
+      }
+
+      raftpb::Entry e; // append new entry
+      e.set_term(incoming.term());
+      e.set_index(incoming.index());
+      e.set_command(incoming.command());
+      raft_->logger->info("Raft node {} appending log entry index {} term {} from leader {}",
+        raft_->id, incoming.index(), incoming.term(), request->leader_id());
+      raft_->log_entries.push_back(std::move(e));
+    }
+
+    // 3. update commit_index from leader_commit
+    uint64_t last_idx_after_append = last_log_index();
+    if (request->leader_commit() > raft_->commit_index) {
+      raft_->commit_index = std::min<uint64_t>(request->leader_commit(), last_idx_after_append);
+    }
+
+    // 4. apply newly committed entries
+    while (raft_->last_applied < raft_->commit_index) {
+      raft_->last_applied += 1;
+      const auto &e = raft_->log_entries[raft_->last_applied];
+
+      ApplyResult result;
+      result.valid = true;
+      result.data = e.command();
+      result.index = e.index(); // should equal last_applied
+      raft_->logger->info("Raft node {} applying committed entry index {} term {}",
+        raft_->id, e.index(), e.term());
+      raft_->apply(result);
+    }
+
     reply->set_term(raft_->current_term);
     reply->set_success(true);
     return grpc::Status::OK;
