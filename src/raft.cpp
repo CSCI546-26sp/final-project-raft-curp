@@ -103,14 +103,28 @@ State Raft::get_state() const {
 
 ProposalResult Raft::propose(const std::string &data) {
   // TODO: lab 2
-  (void) data; // silencing unused warning for now
-
   std::lock_guard<std::mutex> lock(this->mtx);
 
   ProposalResult res;
-  res.index = 0; // dummy index for now
   res.term = this->current_term; // whatever term we are on
   res.is_leader = (this->role == Role::Leader);
+
+  if(!res.is_leader) {
+    res.index = 0;
+    return res; // only leader can accept proposals
+  }
+
+  raftpb::Entry new_entry;
+  new_entry.set_term(this->current_term);
+  new_entry.set_index(this->log_entries.size()); // new entry index is current log size (0-based)
+  new_entry.set_command(data);
+  this->log_entries.push_back(new_entry);
+
+  res.index = new_entry.index();
+
+  logger->info("Raft node {} proposed entry at index {} term {}", 
+                 id, res.index, res.term);
+
   return res;
 }
 
@@ -215,6 +229,11 @@ void Raft::send_request_votes(uint64_t term) {
           this->role = Role::Leader;
           logger->info("Raft node {} becomes leader for term {}", id,
                        this->current_term);
+          for(auto &p: peers_) {
+            this->next_index[p.first] = this->log_entries.size();
+            this->match_index[p.first] = 0;
+            //this->send_heartbeats(this->current_term); // send initial heartbeats immediately after becoming leader
+          }
         }
       }
     }).detach();
