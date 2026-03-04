@@ -222,16 +222,24 @@ void Raft::send_heartbeats(uint64_t term) {
         this->voted_for.reset();
         this->last_heartbeat = std::chrono::steady_clock::now();
         logger->info("Raft node {} stepping down", id);
+        return;
       }
 
       // reply handling
       if (reply.success()) {
         // all entries sent upto last idx replicated on follower
         uint64_t last_sent = prev_log_index + static_cast<uint64_t>(entries_to_send.size());
-        this->next_index[target_id] = last_sent + 1;
-        this->match_index[target_id] = last_sent; 
+        // only advance, never regress (handles out_of_order OR stale replies)
+        uint64_t prev_next = this->next_index[target_id];
+        uint64_t prev_match = this->match_index.count(target_id) ? this->match_index[target_id] : 0;
+        if ((last_sent+1) > prev_next) {
+          this->next_index[target_id] = (last_sent+1);
+        }
+        if (last_sent > prev_match) {
+          this->match_index[target_id] = last_sent;
+        }
 
-        logger->info("Raft node {} replicated log entries upto index {} on follower {}", 
+        logger->info("Raft node {} replicated log entries upto index {} on follower {}",
           id, last_sent, target_id);
 
         // try to advance commit_index
@@ -278,12 +286,15 @@ void Raft::send_heartbeats(uint64_t term) {
             id, e.index(), e.term());
         }
       } else {
-        // backoff, move next_index one step back
+        // backoff: decrement iff this reply is still relevant (no newer success already)
         auto it = this->next_index.find(target_id);
         if (it != this->next_index.end() && it->second > 1) {
-          it->second -= 1;
-          logger->info("Raft node {} backing off next_index for follower {} to {}", 
-            id, target_id, it->second);
+          uint64_t expected_next = (prev_log_index+1);
+          if (it->second <= expected_next) {
+            it->second -= 1;
+            logger->info("Raft node {} backing off next_index for follower {} to {}",
+              id, target_id, it->second);
+          }
         }
       }
     }).detach();
@@ -294,6 +305,14 @@ void Raft::send_request_votes(uint64_t term) {
   size_t total_nodes = peer_addrs.size() + 1;
   size_t majority = total_nodes / 2 + 1;
 
+  uint64_t last_log_idx;
+  uint64_t last_log_term;
+  {
+    std::lock_guard<std::mutex> lock(this->mtx);
+    last_log_idx = this->log_entries.empty() ? 0 : static_cast<uint64_t>(this->log_entries.size() - 1);
+    last_log_term = this->log_entries.empty() ? 0 : this->log_entries.back().term();
+  }
+
   for (auto &p : peers_) {
     uint64_t target_id = p.first;
     auto *stub = p.second.get();
@@ -301,13 +320,13 @@ void Raft::send_request_votes(uint64_t term) {
       continue;
     }
 
-    std::thread([this, term, target_id, majority]() {
+    std::thread([this, term, target_id, majority, last_log_idx, last_log_term]() {
       auto& stub = this->peers_[target_id];
       raftpb::RequestVoteRequest req;
       req.set_term(term);
       req.set_candidate_id(id);
-      req.set_last_log_index(this->log_entries.size() - 1); // last log index (0-based)
-      req.set_last_log_term(this->log_entries.back().term()); // last log term
+      req.set_last_log_index(last_log_idx);
+      req.set_last_log_term(last_log_term);
 
       auto context = this->create_context(target_id);
       raftpb::RequestVoteReply reply;
