@@ -1110,6 +1110,71 @@ TEST_F(RaftTest, RPCCountB) {
   }
 }
 
+TEST_F(RaftTest, 2159570081_StaleLogCannotWinElectionExtraB) {
+  this->init_logger("StaleLogCannotWinElectionExtraB");
+  auto servers = 3;
+  auto local_confs = toolings::ConfigGen::gen_local_instances(servers, 50051);
+  auto r_confs = toolings::ConfigGen::gen_raft_configs(local_confs);
+  toolings::MultiprocTestConfig cfg(r_confs, NODE_APP_PATH, this->logger,
+                                    ddb_conf, 0, this->raft_node_verb);
+
+  try {
+    cfg.begin();
+
+    for (int i = 1; i <= 3; i++) {
+      auto xindex = cfg.one(std::to_string(i * 10), servers, false);
+      ASSERT_TRUE(xindex.has_value()) << "Failed initial commit at index " << i;
+    }
+
+    auto leader1 = cfg.check_one_leader();
+    ASSERT_TRUE(leader1.has_value()) << "No initial leader";
+
+    // pick a follower that is NOT the leader to isolate
+    auto stale_node = cfg.pick_n_servers(1, leader1.value()).front();
+    logger->info("Isolating node {} to become stale", stale_node);
+    cfg.disconnect(stale_node);
+
+    for (int i = 4; i <= 8; i++) {
+      auto xindex = cfg.one(std::to_string(i * 10), servers - 1, false);
+      ASSERT_TRUE(xindex.has_value())
+          << "Failed commit at index " << i << " with reduced quorum";
+    }
+
+    auto term_after = cfg.check_terms();
+    ASSERT_TRUE(term_after.has_value());
+    logger->info("Term after majority commits: {}", *term_after);
+    cfg.reconnect(stale_node);
+
+    auto current_leader = cfg.check_one_leader();
+    ASSERT_TRUE(current_leader.has_value());
+    cfg.disconnect(*current_leader);
+
+    // Give time for elections
+    std::this_thread::sleep_for(2 * TIMEOUT);
+
+    cfg.reconnect(*current_leader);
+    std::this_thread::sleep_for(TIMEOUT);
+
+    auto final_leader = cfg.check_one_leader();
+    ASSERT_TRUE(final_leader.has_value()) << "No leader after reconnection";
+
+    for (int i = 1; i <= 8; i++) {
+      auto cr = cfg.n_committed(i);
+      ASSERT_TRUE(cr.num >= 1)
+          << "Committed entry at index " << i << " was lost!";
+    }
+
+    // And we should be able to commit new entries
+    auto xindex = cfg.one("999", servers, false);
+    ASSERT_TRUE(xindex.has_value()) << "Cannot commit after stale election attempt";
+
+    logger->info("StaleLogCannotWinElection passed. Final leader: {}", *final_leader);
+  } catch (const std::exception &e) {
+    logger->error("Exception: {}", e.what());
+    FAIL() << "Exception: " << e.what();
+  }
+}
+
 static pid_t pgid = 0;
 
 void signal_handler(int signal) {
