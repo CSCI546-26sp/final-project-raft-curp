@@ -287,15 +287,35 @@ void Raft::send_heartbeats(uint64_t term) {
         }
       } else {
         // backoff: decrement iff this reply is still relevant (no newer success already)
-        auto it = this->next_index.find(target_id);
-        if (it != this->next_index.end() && it->second > 1) {
-          uint64_t expected_next = (prev_log_index+1);
-          if (it->second <= expected_next) {
-            it->second -= 1;
-            logger->info("Raft node {} backing off next_index for follower {} to {}",
-              id, target_id, it->second);
-          }
+        uint64_t cf_term = reply.conflict_term();
+        uint64_t cf_index = reply.conflict_index();
+        if(cf_term == 0){
+          this->next_index[target_id] = cf_index;
         }
+        else{
+          uint64_t new_next = cf_index;
+          for(uint64_t i = this->log_entries.size() - 1; i >= 1; --i){
+            if(this->log_entries[i].term() == cf_term){
+              new_next = i + 1;
+              break;
+            }
+          }
+          this->next_index[target_id] = new_next;
+        }
+        if(this->next_index[target_id] < 1) {
+          this->next_index[target_id] = 1;
+        }
+        logger->info("Raft node {} backing off next_index for follower {} to {} based on conflict term {} and index {}",
+          id, target_id, this->next_index[target_id], cf_term, cf_index);
+        // auto it = this->next_index.find(target_id);
+        // if (it != this->next_index.end() && it->second > 1) {
+        //   uint64_t expected_next = (prev_log_index+1);
+        //   if (it->second <= expected_next) {
+        //     it->second -= 1;
+        //     logger->info("Raft node {} backing off next_index for follower {} to {}",
+        //       id, target_id, it->second);
+        //   }
+        // }
       }
     }).detach();
   }
@@ -414,6 +434,8 @@ grpc::Status Raft::RaftServiceImpl::AppendEntries(
         raft_->id, prev_index, last_log_index());
       reply->set_term(raft_->current_term);
       reply->set_success(false);
+      reply->set_conflict_term(0);
+      reply->set_conflict_index(raft_->log_entries.size()); // next index to append
       return grpc::Status::OK;
     }
 
@@ -422,8 +444,15 @@ grpc::Status Raft::RaftServiceImpl::AppendEntries(
       if (prev_entry.term() != prev_term) {
         raft_->logger->info("Raft node {} rejecting AppendEntries due to term mismatch at index {} (expected {}, got {}) (last log index: {})", 
           raft_->id, prev_index, prev_term, prev_entry.term(), last_log_index());
+        uint64_t conflict_term = prev_entry.term();
+        uint64_t conflict_index = prev_index;
+        while(conflict_index > 1 && raft_->log_entries[conflict_index-1].term() == conflict_term) {
+          conflict_index -= 1;
+        }
         reply->set_term(raft_->current_term);
         reply->set_success(false);
+        reply->set_conflict_term(conflict_term);
+        reply->set_conflict_index(conflict_index);
         return grpc::Status::OK;
       }
     }
