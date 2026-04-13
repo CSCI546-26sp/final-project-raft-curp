@@ -10,8 +10,20 @@
 #include "common/common.hpp"
 #include "kv.grpc.pb.h"
 #include "rafty/raft.hpp"
+#include <future>
+#include <thread>
 
 namespace kv {
+
+struct OpResult{
+  std::string value;
+  kvpb::KvStatus status;
+};
+
+struct RiflEntry{
+  uint64_t seq_num;
+  OpResult result;
+};
 
 class KvServer : public kvpb::KvService::Service {
 public:
@@ -87,6 +99,12 @@ public:
 
 private:
   rafty::Raft &raft_;
+
+  std::mutex mu_;
+
+  std::unordered_map<std::string, std::string> store_;
+  std::unordered_map<uint64_t, RiflEntry> rifl_cache_;
+  std::unordered_map<uint64_t, std::promise<OpResult>> waiters_;
 
   // TODO (lab 3): add your state here. Consider:
   //
