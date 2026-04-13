@@ -11,7 +11,8 @@
 #include "kv.grpc.pb.h"
 #include "rafty/raft.hpp"
 #include <future>
-#include <thread>
+#include <sstream>
+#include <chrono>
 
 namespace kv {
 
@@ -36,6 +37,12 @@ public:
     // TODO (lab 3): clean up any background threads.
   }
 
+  std::future<OpResult> register_waiter(uint64_t index){
+    std::lock_guard<std::mutex> lock(mu_);
+    auto &promise = waiters_[index];
+    return promise.get_future();
+  }
+
   // -----------------------------------------------------------------
   // on_apply is called by the node wrapper each time Raft commits a
   // log entry. The ApplyResult contains the index and data of the
@@ -49,7 +56,56 @@ public:
   // -----------------------------------------------------------------
   void on_apply(const rafty::ApplyResult &result) {
     // TODO (lab 3): implement this.
-    (void)result;
+    if(!result.valid) {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto wit = waiters_.find(result.index);
+      if(wit != waiters_.end()) {
+        wit->second.set_value({"", kvpb::KV_TIMEOUT});
+        waiters_.erase(wit);
+      }
+      return;
+    }
+    std::istringstream ss(result.data);
+    std::string op, key, value;
+    uint64_t client_id, seq_num;
+    std::getline(ss, op, '\t');
+    std::getline(ss, key, '\t');
+    std::getline(ss, value, '\t');
+    ss >> client_id;
+    ss.ignore();
+    ss >> seq_num;
+
+    std::lock_guard<std::mutex> lock(mu_);
+
+    OpResult op_result;
+
+    auto it = rifl_cache_.find(client_id);
+    if (it != rifl_cache_.end() && it->second.seq_num >= seq_num) {
+      op_result = it->second.result;
+    }
+    else {
+      if (op == "PUT") {
+        store_[key] = value;
+        op_result = {"", kvpb::KV_SUCCESS};
+      }
+      else if (op == "APPEND") {
+        store_[key] += value;
+        op_result = {"", kvpb::KV_SUCCESS};
+      }
+      else if (op == "GET") {
+        auto kit = store_.find(key);
+        std::string val = (kit != store_.end()) ? kit->second : "";
+        op_result = {val, kvpb::KV_SUCCESS};
+      }
+
+      rifl_cache_[client_id] = {seq_num, op_result};
+    }
+
+    auto wit = waiters_.find(result.index);
+      if(wit != waiters_.end()) {
+        wit->second.set_value(op_result);
+        waiters_.erase(wit);
+      }
   }
 
   // -----------------------------------------------------------------
@@ -72,8 +128,33 @@ public:
                    kvpb::KvResponse *response) override {
     // TODO (lab 3): implement
     (void)context;
-    (void)request;
-    response->set_status(kvpb::KV_TIMEOUT);
+
+    if(!raft_.get_state().is_leader) {
+      response->set_status(kvpb::KV_NOTLEADER);
+      return grpc::Status::OK;
+    }
+
+    std::string op = "PUT\t" + request->key() + "\t" + request->value() +
+                      "\t" + std::to_string(request->client_id()) +
+                      "\t" + std::to_string(request->seq_num());
+
+    auto proposal = raft_.propose(op);
+    if(!proposal.is_leader) {
+      response->set_status(kvpb::KV_NOTLEADER);
+      return grpc::Status::OK;
+    }
+
+    auto fut = register_waiter(proposal.index);
+
+    if(fut.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
+      std::lock_guard<std::mutex> lock(mu_);
+      waiters_.erase(proposal.index);
+      response->set_status(kvpb::KV_TIMEOUT);
+      return grpc::Status::OK;
+    }
+
+    auto op_result = fut.get();
+    response->set_status(op_result.status);
     return grpc::Status::OK;
   }
 
@@ -82,8 +163,34 @@ public:
                    kvpb::GetResponse *response) override {
     // TODO (lab 3): implement
     (void)context;
-    (void)request;
-    response->set_status(kvpb::KV_TIMEOUT);
+
+    if(!raft_.get_state().is_leader) {
+      response->set_status(kvpb::KV_NOTLEADER);
+      return grpc::Status::OK;
+    }
+
+    std::string op = "GET\t" + request->key() + "\t\t" +
+                   std::to_string(request->client_id()) +
+                   "\t" + std::to_string(request->seq_num());
+
+    auto proposal = raft_.propose(op);
+    if(!proposal.is_leader) {
+      response->set_status(kvpb::KV_NOTLEADER);
+      return grpc::Status::OK;
+    }
+
+    auto fut = register_waiter(proposal.index);
+
+    if(fut.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
+      std::lock_guard<std::mutex> lock(mu_);
+      waiters_.erase(proposal.index);
+      response->set_status(kvpb::KV_TIMEOUT);
+      return grpc::Status::OK;
+    }
+
+    auto op_result = fut.get();
+    response->set_status(op_result.status);
+    response->set_value(op_result.value);
     return grpc::Status::OK;
   }
 
@@ -94,7 +201,6 @@ public:
     (void)context;
     (void)request;
     response->set_status(kvpb::KV_TIMEOUT);
-    return grpc::Status::OK;
   }
 
 private:
