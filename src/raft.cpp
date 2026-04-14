@@ -297,7 +297,7 @@ void Raft::send_heartbeats(uint64_t term) {
         } else {
           // find last index with conflict_term in our log
           uint64_t new_next = cf_index;
-          for (uint64_t i = this->log_entries.size() - 1; i >= 1; --i) {
+          for (uint64_t i = static_cast<uint64_t>(this->log_entries.size()); i-- > 1;) {
             if (this->log_entries[i].term() == cf_term) {
               new_next = i + 1;
               break;

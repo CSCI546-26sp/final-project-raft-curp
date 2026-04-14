@@ -13,6 +13,8 @@
 #include <future>
 #include <sstream>
 #include <chrono>
+#include <optional>
+#include <unordered_set>
 
 namespace kv {
 
@@ -39,8 +41,28 @@ public:
 
   std::future<OpResult> register_waiter(uint64_t index){
     std::lock_guard<std::mutex> lock(mu_);
+
+    // If already applied before waiter registration, return immediately.
+    auto rit = applied_results_.find(index);
+    if (rit != applied_results_.end()) {
+      std::promise<OpResult> p;
+      auto fut = p.get_future();
+      p.set_value(rit->second);
+      applied_results_.erase(rit);
+      return fut;
+    }
+
     auto &promise = waiters_[index];
     return promise.get_future();
+  }
+
+  std::optional<OpResult> check_rifl_cache(uint64_t client_id, uint64_t seq_num) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = rifl_cache_.find(client_id);
+    if (it != rifl_cache_.end() && it->second.seq_num >= seq_num) {
+      return it->second.result;
+    }
+    return std::nullopt;
   }
 
   // -----------------------------------------------------------------
@@ -58,10 +80,15 @@ public:
     // TODO (lab 3): implement this.
     if(!result.valid) {
       std::lock_guard<std::mutex> lock(mu_);
+      if (abandoned_indices_.erase(result.index) > 0) {
+        return;
+      }
       auto wit = waiters_.find(result.index);
       if(wit != waiters_.end()) {
         wit->second.set_value({"", kvpb::KV_TIMEOUT});
         waiters_.erase(wit);
+      } else {
+        applied_results_[result.index] = {"", kvpb::KV_TIMEOUT};
       }
       return;
     }
@@ -76,6 +103,10 @@ public:
     ss >> seq_num;
 
     std::lock_guard<std::mutex> lock(mu_);
+
+    if (abandoned_indices_.erase(result.index) > 0) {
+      return;
+    }
 
     OpResult op_result;
 
@@ -105,6 +136,8 @@ public:
       if(wit != waiters_.end()) {
         wit->second.set_value(op_result);
         waiters_.erase(wit);
+      } else {
+        applied_results_[result.index] = op_result;
       }
   }
 
@@ -134,6 +167,12 @@ public:
       return grpc::Status::OK;
     }
 
+    // RIFL duplicate detection: if already executed, return cached result.
+    if (auto cached = check_rifl_cache(request->client_id(), request->seq_num())) {
+      response->set_status(cached->status);
+      return grpc::Status::OK;
+    }
+
     std::string op = "PUT\t" + request->key() + "\t" + request->value() +
                       "\t" + std::to_string(request->client_id()) +
                       "\t" + std::to_string(request->seq_num());
@@ -149,6 +188,7 @@ public:
     if(fut.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
       std::lock_guard<std::mutex> lock(mu_);
       waiters_.erase(proposal.index);
+      abandoned_indices_.insert(proposal.index);
       response->set_status(kvpb::KV_TIMEOUT);
       return grpc::Status::OK;
     }
@@ -169,6 +209,13 @@ public:
       return grpc::Status::OK;
     }
 
+    // RIFL duplicate detection: if already executed, return cached result.
+    if (auto cached = check_rifl_cache(request->client_id(), request->seq_num())) {
+      response->set_status(cached->status);
+      response->set_value(cached->value);
+      return grpc::Status::OK;
+    }
+
     std::string op = "GET\t" + request->key() + "\t\t" +
                    std::to_string(request->client_id()) +
                    "\t" + std::to_string(request->seq_num());
@@ -184,6 +231,7 @@ public:
     if(fut.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
       std::lock_guard<std::mutex> lock(mu_);
       waiters_.erase(proposal.index);
+      abandoned_indices_.insert(proposal.index);
       response->set_status(kvpb::KV_TIMEOUT);
       return grpc::Status::OK;
     }
@@ -199,8 +247,41 @@ public:
                       kvpb::KvResponse *response) override {
     // TODO (lab 3): implement
     (void)context;
-    (void)request;
-    response->set_status(kvpb::KV_TIMEOUT);
+
+    if(!raft_.get_state().is_leader) {
+      response->set_status(kvpb::KV_NOTLEADER);
+      return grpc::Status::OK;
+    }
+
+    // RIFL duplicate detection: if already executed, return cached result.
+    if (auto cached = check_rifl_cache(request->client_id(), request->seq_num())) {
+      response->set_status(cached->status);
+      return grpc::Status::OK;
+    }
+
+    std::string op = "APPEND\t" + request->key() + "\t" + request->value() +
+                      "\t" + std::to_string(request->client_id()) +
+                      "\t" + std::to_string(request->seq_num());
+
+    auto proposal = raft_.propose(op);
+    if(!proposal.is_leader) {
+      response->set_status(kvpb::KV_NOTLEADER);
+      return grpc::Status::OK;
+    }
+
+    auto fut = register_waiter(proposal.index);
+
+    if(fut.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
+      std::lock_guard<std::mutex> lock(mu_);
+      waiters_.erase(proposal.index);
+      abandoned_indices_.insert(proposal.index);
+      response->set_status(kvpb::KV_TIMEOUT);
+      return grpc::Status::OK;
+    }
+
+    auto op_result = fut.get();
+    response->set_status(op_result.status);
+    return grpc::Status::OK;
   }
 
 private:
@@ -211,6 +292,8 @@ private:
   std::unordered_map<std::string, std::string> store_;
   std::unordered_map<uint64_t, RiflEntry> rifl_cache_;
   std::unordered_map<uint64_t, std::promise<OpResult>> waiters_;
+  std::unordered_map<uint64_t, OpResult> applied_results_;
+  std::unordered_set<uint64_t> abandoned_indices_;
 
   // TODO (lab 3): add your state here. Consider:
   //
