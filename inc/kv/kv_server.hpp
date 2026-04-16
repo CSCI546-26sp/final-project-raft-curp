@@ -80,15 +80,17 @@ public:
     // TODO (lab 3): implement this.
     if(!result.valid) {
       std::lock_guard<std::mutex> lock(mu_);
-      if (abandoned_indices_.erase(result.index) > 0) {
-        return;
-      }
       auto wit = waiters_.find(result.index);
       if(wit != waiters_.end()) {
         wit->second.set_value({"", kvpb::KV_TIMEOUT});
         waiters_.erase(wit);
       } else {
-        applied_results_[result.index] = {"", kvpb::KV_TIMEOUT};
+        // If an RPC timed out waiting for this index, don't keep a result
+        // buffer around forever. The KV state is still correct (no-op for
+        // invalid apply), and client retries will be handled via Raft/RIFL.
+        if (abandoned_indices_.erase(result.index) == 0) {
+          applied_results_[result.index] = {"", kvpb::KV_TIMEOUT};
+        }
       }
       return;
     }
@@ -103,10 +105,6 @@ public:
     ss >> seq_num;
 
     std::lock_guard<std::mutex> lock(mu_);
-
-    if (abandoned_indices_.erase(result.index) > 0) {
-      return;
-    }
 
     OpResult op_result;
 
@@ -133,12 +131,16 @@ public:
     }
 
     auto wit = waiters_.find(result.index);
-      if(wit != waiters_.end()) {
-        wit->second.set_value(op_result);
-        waiters_.erase(wit);
-      } else {
+    if(wit != waiters_.end()) {
+      wit->second.set_value(op_result);
+      waiters_.erase(wit);
+    } else {
+      // If the waiting RPC already timed out, don't retain a buffered result.
+      // We still applied to store_ and updated rifl_cache_ above.
+      if (abandoned_indices_.erase(result.index) == 0) {
         applied_results_[result.index] = op_result;
       }
+    }
   }
 
   // -----------------------------------------------------------------
