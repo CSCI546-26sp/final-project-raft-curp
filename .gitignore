@@ -36,3 +36,13 @@ build/
 
 .cache/
 *.log
+
+# Scripts (Lab 3 DDL2)
+submitter/check.sh
+submitter/env
+submitter/packer.sh
+submitter/submit.sh
+
+# Benchmark outputs (Lab 3 DDL2)
+result.txt
+bench/lat-tput.png
