@@ -72,13 +72,16 @@ inline void Raft::connect_peers() {
     auto stub = raftpb::RaftService::NewStub(std::move(channel)); // Client Stubs
     peers_[peer_addr.first] = std::move(stub);
   }
+
+  // Ensure background replication workers exist after peers are connected.
+  this->start_replication_workers();
 }
 
 inline bool Raft::is_dead() const { return this->dead.load(); }
 
 inline void Raft::kill() {
   this->dead.store(true);
-  // add your code here if needed.
+  this->signal_replication();
 }
 
 inline std::unique_ptr<grpc::ClientContext>

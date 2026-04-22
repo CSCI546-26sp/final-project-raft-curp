@@ -4,6 +4,10 @@
 #include "common/utils/tracing.hpp"
 #endif
 
+#include <chrono>
+#include <thread>
+#include <vector>
+
 namespace rafty {
 using grpc::ServerBuilder;
 using grpc::ServerContext;
@@ -32,7 +36,89 @@ Raft::Raft(const Config &config, MessageQueue<ApplyResult> &ready)
   this->log_entries.push_back(dummy_entry); // index 0 is dummy entry
 }
 
-Raft::~Raft() { this->stop_server(); }
+Raft::~Raft() {
+  this->kill();
+  this->signal_replication();
+  for (auto &t : this->repl_workers_) {
+    if (t.joinable()) {
+      t.join();
+    }
+  }
+  this->stop_server();
+}
+
+void Raft::signal_replication() {
+  {
+    std::lock_guard<std::mutex> lk(this->repl_mu_);
+    this->repl_epoch_.fetch_add(1, std::memory_order_release);
+  }
+  this->repl_cv_.notify_all();
+}
+
+void Raft::start_replication_workers() {
+  bool expected = false;
+  if (!this->repl_started_.compare_exchange_strong(expected, true)) {
+    return;
+  }
+
+  for (auto &p : peers_) {
+    uint64_t target_id = p.first;
+    if (!p.second) {
+      continue;
+    }
+    this->repl_workers_.emplace_back(
+        [this, target_id]() { this->replication_worker(target_id); });
+  }
+}
+
+void Raft::replication_worker(uint64_t target_id) {
+  auto next_hb = std::chrono::steady_clock::now();
+  uint64_t seen_epoch = this->repl_epoch_.load(std::memory_order_acquire);
+
+  while (!this->is_dead()) {
+    uint64_t term = 0;
+    bool leader = false;
+    uint64_t last_idx = 0;
+    uint64_t next_idx = 0;
+    {
+      std::lock_guard<std::mutex> lock(this->mtx);
+      leader = (this->role == Role::Leader);
+      term = this->current_term;
+      last_idx = this->log_entries.empty()
+                     ? 0
+                     : static_cast<uint64_t>(this->log_entries.size() - 1);
+      auto it = this->next_index.find(target_id);
+      next_idx = (it == this->next_index.end()) ? (last_idx + 1) : it->second;
+    }
+
+    if (!leader) {
+      std::unique_lock<std::mutex> lk(this->repl_mu_);
+      this->repl_cv_.wait_for(lk, std::chrono::milliseconds(10), [&] {
+        return this->is_dead() ||
+               this->repl_epoch_.load(std::memory_order_acquire) != seen_epoch;
+      });
+      seen_epoch = this->repl_epoch_.load(std::memory_order_acquire);
+      continue;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    const bool have_entries = (next_idx <= last_idx);
+    const bool heartbeat_due = (now >= next_hb);
+
+    if (have_entries || heartbeat_due) {
+      (void)this->replicate_to_follower(target_id, term);
+      next_hb = std::chrono::steady_clock::now() + heartbeat_interval;
+      continue;
+    }
+
+    std::unique_lock<std::mutex> lk(this->repl_mu_);
+    this->repl_cv_.wait_until(lk, next_hb, [&] {
+      return this->is_dead() ||
+             this->repl_epoch_.load(std::memory_order_acquire) != seen_epoch;
+    });
+    seen_epoch = this->repl_epoch_.load(std::memory_order_acquire);
+  }
+}
 
 void Raft::run() {
   // TODO: kick off the raft instance
@@ -51,14 +137,15 @@ void Raft::run() {
         auto now = std::chrono::steady_clock::now();
 
         if (this->role == Role::Leader) {
-          if (now >= next_heartbeat) {   // is this correct? or should we check the elapsed time since last heartbeat?
+          if (now >= next_heartbeat) {
             next_heartbeat = now + heartbeat_interval;
 
             auto term = this->current_term;
 
-            // send heartbeats w/o holding lock
+            // Kick background replicators (they also do periodic heartbeats).
             lock.unlock();
-            this->send_heartbeats(term);
+            (void)term;
+            this->signal_replication();
             lock.lock();
           }
         } else {
@@ -85,11 +172,14 @@ void Raft::run() {
         }
       }
 
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     
     logger->info("Raft node {} run loop exit", id);
   }).detach();
+
+  // Background replication workers (one per follower).
+  this->start_replication_workers();
 }
 
 State Raft::get_state() const {
@@ -103,31 +193,35 @@ State Raft::get_state() const {
 
 ProposalResult Raft::propose(const std::string &data) {
   // TODO: lab 2
-  std::lock_guard<std::mutex> lock(this->mtx);
-
   ProposalResult res;
-  res.term = this->current_term; // whatever term we are on
-  res.is_leader = (this->role == Role::Leader);
 
-  if(!res.is_leader) {
-    res.index = 0;
-    return res; // only leader can accept proposals
+  {
+    std::lock_guard<std::mutex> lock(this->mtx);
+
+    res.term = this->current_term;
+    res.is_leader = (this->role == Role::Leader);
+
+    if (!res.is_leader) {
+      res.index = 0;
+      return res;
+    }
+
+    raftpb::Entry new_entry;
+    new_entry.set_term(this->current_term);
+    new_entry.set_index(this->log_entries.size());
+    new_entry.set_command(data);
+    this->log_entries.push_back(new_entry);
+
+    this->match_index[id] = new_entry.index();
+    this->next_index[id] = new_entry.index() + 1;
+
+    res.index = new_entry.index();
+
+    logger->debug("Raft node {} proposed entry at index {} term {}", id, res.index, res.term);
   }
 
-  raftpb::Entry new_entry;
-  new_entry.set_term(this->current_term);
-  new_entry.set_index(this->log_entries.size()); // new entry index is current log size (0-based)
-  new_entry.set_command(data);
-  this->log_entries.push_back(new_entry);
-
-  // update leader's own indices for the new entry
-  this->match_index[id] = new_entry.index();
-  this->next_index[id] = new_entry.index() + 1;
-
-  res.index = new_entry.index();
-
-  logger->info("Raft node {} proposed entry at index {} term {}", 
-                 id, res.index, res.term);
+  // Replication happens on background per-follower workers.
+  this->signal_replication();
 
   return res;
 }
@@ -135,6 +229,268 @@ ProposalResult Raft::propose(const std::string &data) {
 ProposalResult Raft::propose_sync(const std::string &data) {
   // TODO: lab 3
   return propose(data);
+}
+
+bool Raft::replicate_to_follower(uint64_t target_id, uint64_t term) {
+  auto *stub = this->peers_[target_id].get();
+  if (!stub) {
+    return false;
+  }
+
+  uint64_t prev_log_index = 0;
+  uint64_t prev_log_term = 0;
+  uint64_t leader_commit = 0;
+  std::vector<raftpb::Entry> entries_to_send;
+
+  {
+    std::unique_lock<std::mutex> lock(this->mtx);
+
+    if (this->role != Role::Leader || this->current_term != term) {
+      return false;
+    }
+
+    if (!this->next_index.count(target_id)) {
+      this->next_index[target_id] = this->log_entries.size();
+    }
+
+    uint64_t next_idx = this->next_index[target_id];
+    if (next_idx < 1) {
+      next_idx = 1;
+    }
+    if (next_idx > this->log_entries.size()) {
+      next_idx = this->log_entries.size();
+    }
+    prev_log_index = next_idx - 1;
+    prev_log_term = this->log_entries[prev_log_index].term();
+    leader_commit = this->commit_index;
+
+    entries_to_send.assign(this->log_entries.begin() + static_cast<std::ptrdiff_t>(next_idx),
+                           this->log_entries.end());
+    lock.unlock();
+  }
+
+  raftpb::AppendEntriesRequest req;
+  req.set_term(term);
+  req.set_leader_id(this->id);
+  req.set_prev_log_index(prev_log_index);
+  req.set_prev_log_term(prev_log_term);
+  req.set_leader_commit(leader_commit);
+
+  for (const auto &e : entries_to_send) {
+    auto *added = req.add_entries();
+    added->set_term(e.term());
+    added->set_index(e.index());
+    added->set_command(e.command());
+  }
+
+  auto context = this->create_context(target_id);
+  raftpb::AppendEntriesReply reply;
+
+  grpc::Status status = stub->AppendEntries(context.get(), req, &reply);
+  if (!status.ok()) {
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lock(this->mtx);
+  if (this->role != Role::Leader || this->current_term != term) {
+    return false;
+  }
+
+  if (reply.term() > this->current_term) {
+    this->current_term = reply.term();
+    this->role = Role::Follower;
+    this->voted_for.reset();
+    this->last_heartbeat = std::chrono::steady_clock::now();
+    logger->info("Raft node {} stepping down", id);
+    return false;
+  }
+
+  if (reply.success()) {
+    uint64_t last_sent =
+        prev_log_index + static_cast<uint64_t>(entries_to_send.size());
+    uint64_t prev_next = this->next_index[target_id];
+    uint64_t prev_match = this->match_index.count(target_id) ? this->match_index[target_id] : 0;
+    if ((last_sent + 1) > prev_next) {
+      this->next_index[target_id] = (last_sent + 1);
+    }
+    if (last_sent > prev_match) {
+      this->match_index[target_id] = last_sent;
+    }
+
+    logger->debug("Raft node {} replicated log entries upto index {} on follower {}", id,
+                  last_sent, target_id);
+
+    uint64_t last_idx = this->log_entries.size() - 1;
+    size_t total_nodes = peer_addrs.size() + 1;
+    size_t majority = total_nodes / 2 + 1;
+
+    for (uint64_t N = this->commit_index + 1; N <= last_idx; ++N) {
+      size_t count = 0;
+
+      auto self_it = this->match_index.find(this->id);
+      if (self_it != this->match_index.end() && self_it->second >= N) {
+        ++count;
+      }
+
+      for (const auto &kv : this->match_index) {
+        if (kv.first == this->id) {
+          continue;
+        }
+        if (kv.second >= N) {
+          ++count;
+        }
+      }
+
+      if (count >= majority && this->log_entries[N].term() == this->current_term) {
+        this->commit_index = N;
+        logger->debug("Raft node {} advanced commit_index to {}", id, N);
+      }
+    }
+
+    while (this->last_applied < this->commit_index) {
+      this->last_applied += 1;
+      const auto &e = this->log_entries[this->last_applied];
+
+      ApplyResult result;
+      result.valid = true;
+      result.data = e.command();
+      result.index = e.index();
+      this->apply(result);
+      logger->debug("Raft node {} applied committed entry index {} term {}", id, e.index(),
+                    e.term());
+    }
+    return true;
+  }
+
+  uint64_t cf_term = reply.conflict_term();
+  uint64_t cf_index = reply.conflict_index();
+
+  uint64_t candidate_next;
+  if (cf_term == 0) {
+    candidate_next = cf_index;
+  } else {
+    uint64_t new_next = cf_index;
+    for (uint64_t i = static_cast<uint64_t>(this->log_entries.size()); i-- > 1;) {
+      if (this->log_entries[i].term() == cf_term) {
+        new_next = i + 1;
+        break;
+      }
+    }
+    candidate_next = new_next;
+  }
+
+  if (candidate_next < 1) {
+    candidate_next = 1;
+  }
+
+  uint64_t old_next = this->next_index[target_id];
+  if (candidate_next < old_next) {
+    this->next_index[target_id] = candidate_next;
+    logger->debug(
+        "Raft node {} backing off next_index for follower {} to {} based on conflict term {} "
+        "and index {}",
+        id, target_id, this->next_index[target_id], cf_term, cf_index);
+  }
+  return false;
+}
+
+uint64_t Raft::get_commit_index() const {
+  std::lock_guard<std::mutex> lock(this->mtx);
+  return this->commit_index;
+}
+
+bool Raft::read_quorum_barrier(std::chrono::milliseconds timeout) {
+  uint64_t term = 0;
+  {
+    std::lock_guard<std::mutex> lock(this->mtx);
+    if (this->role != Role::Leader) {
+      return false;
+    }
+    term = this->current_term;
+  }
+
+  const size_t total_nodes = peer_addrs.size() + 1;
+  const size_t majority = total_nodes / 2 + 1;
+
+  if (peers_.empty()) {
+    return true;
+  }
+
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  // Confirm leadership by contacting a quorum. Avoid per-read thread creation:
+  // for 3 nodes, we only need self + 1 follower.
+  size_t ok = 1;
+  for (auto &p : peers_) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+    uint64_t target_id = p.first;
+    if (!p.second) {
+      continue;
+    }
+    if (this->replicate_to_follower(target_id, term)) {
+      ++ok;
+      if (ok >= majority) {
+        break;
+      }
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(this->mtx);
+    if (!(this->role == Role::Leader && this->current_term == term && ok >= majority)) {
+      return false;
+    }
+  }
+  
+  uint64_t noop_idx = 0;
+  bool need_noop = false;
+  {
+    std::lock_guard<std::mutex> lock(this->mtx);
+    if (this->role != Role::Leader || this->current_term != term) {
+      return false;
+    }
+    if (this->commit_index == 0 || this->log_entries[this->commit_index].term() != this->current_term) {
+      need_noop = true;
+    }
+  }
+  if (!need_noop) {
+    return true;
+  }
+
+  // Append a NOOP entry in this term and replicate immediately.
+  {
+    std::lock_guard<std::mutex> lock(this->mtx);
+    if (this->role != Role::Leader || this->current_term != term) {
+      return false;
+    }
+    raftpb::Entry e;
+    e.set_term(this->current_term);
+    e.set_index(this->log_entries.size());
+    e.set_command("NOOP\t\t\t0\t0");
+    this->log_entries.push_back(e);
+    this->match_index[this->id] = e.index();
+    this->next_index[this->id] = e.index() + 1;
+    noop_idx = e.index();
+  }
+  this->signal_replication();
+
+  // Wait for NOOP to become committed (bounded by the same deadline).
+  while (true) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> lock(this->mtx);
+      if (this->role != Role::Leader || this->current_term != term) {
+        return false;
+      }
+      if (this->commit_index >= noop_idx) {
+        return true;
+      }
+    }
+    std::this_thread::yield();
+  }
 }
 
 // TODO: add more functions if desired.
@@ -156,169 +512,26 @@ std::chrono::milliseconds Raft::get_random_election_timeout() {
 void Raft::send_heartbeats(uint64_t term) {
   for (auto &p : peers_) {
     uint64_t target_id = p.first;
-    auto *stub = p.second.get();
-    if (!stub) {
+    if (!p.second) {
       continue;
     }
+    (void)this->replicate_to_follower(target_id, term);
+  }
+}
 
-    std::unique_lock<std::mutex> lock(this->mtx);
-
-    if (!this->next_index.count(target_id)) {
-      // default: next index starts at end of log (1-based, dummy at 0)
-      this->next_index[target_id] = this->log_entries.size();
+void Raft::send_heartbeats(uint64_t term, uint64_t min_commit_index) {
+  for (auto &p : peers_) {
+    uint64_t target_id = p.first;
+    if (!p.second) {
+      continue;
     }
-
-    uint64_t next_idx = this->next_index[target_id];
-    if (next_idx < 1) {
-      next_idx = 1;
-    }
-    if (next_idx > this->log_entries.size()) {
-      next_idx = this->log_entries.size();
-    }
-    uint64_t prev_log_index = next_idx - 1;
-    uint64_t prev_log_term = this->log_entries[prev_log_index].term();
-    uint64_t leader_commit = this->commit_index;
-
-    std::vector<raftpb::Entry> entries_to_send(
-            this->log_entries.begin() + next_idx,
-            this->log_entries.end()
-        );
-
-    lock.unlock();
-
-    std::thread([this, term, target_id, prev_log_index, prev_log_term, leader_commit, entries_to_send]() {
-      auto& stub = this->peers_[target_id];
-      raftpb::AppendEntriesRequest req;
-      req.set_term(term);
-      req.set_leader_id(this->id);
-      req.set_prev_log_index(prev_log_index);
-      req.set_prev_log_term(prev_log_term);
-      req.set_leader_commit(leader_commit);
-
-      // add log entries to replicate (empty for pure heartbeat)
-      for (const auto &e : entries_to_send) {
-        auto *added = req.add_entries();
-        added->set_term(e.term());
-        added->set_index(e.index());
-        added->set_command(e.command());
-      }
-
-      auto context = this->create_context(target_id);
-      raftpb::AppendEntriesReply reply;
-
-      grpc::Status status = stub->AppendEntries(context.get(), req, &reply);
-      if (!status.ok()) {
-        return;
-      }
-
+    (void)this->replicate_to_follower(target_id, term);
+    {
       std::lock_guard<std::mutex> lock(this->mtx);
-      if (this->role != Role::Leader || this->current_term != term) {
+      if (this->commit_index >= min_commit_index) {
         return;
       }
-      
-      if (reply.term() > this->current_term) {
-        this->current_term = reply.term();
-        this->role = Role::Follower;
-        this->voted_for.reset();
-        this->last_heartbeat = std::chrono::steady_clock::now();
-        logger->info("Raft node {} stepping down", id);
-        return;
-      }
-
-      // reply handling
-      if (reply.success()) {
-        // all entries sent upto last idx replicated on follower
-        uint64_t last_sent = prev_log_index + static_cast<uint64_t>(entries_to_send.size());
-        // only advance, never regress (handles out_of_order OR stale replies)
-        uint64_t prev_next = this->next_index[target_id];
-        uint64_t prev_match = this->match_index.count(target_id) ? this->match_index[target_id] : 0;
-        if ((last_sent+1) > prev_next) {
-          this->next_index[target_id] = (last_sent+1);
-        }
-        if (last_sent > prev_match) {
-          this->match_index[target_id] = last_sent;
-        }
-
-        logger->info("Raft node {} replicated log entries upto index {} on follower {}",
-          id, last_sent, target_id);
-
-        // try to advance commit_index
-        uint64_t last_idx = this->log_entries.size() - 1;
-        size_t total_nodes = peer_addrs.size() + 1;
-        size_t majority = total_nodes / 2 + 1;
-
-        for (uint64_t N=this->commit_index+1; N<=last_idx; ++N) {
-          size_t count = 0;
-
-          // count leader itself
-          auto self_it = this->match_index.find(this->id);
-          if (self_it != this->match_index.end() && self_it->second >= N) {
-            ++count;
-          }
-
-          // count followers
-          for (const auto &kv: this->match_index) {
-            if (kv.first == this->id) {
-              continue;
-            }
-            if (kv.second >= N) {
-              ++count;
-            }
-          }
-
-          if (count >= majority && this->log_entries[N].term() == this->current_term) {
-            this->commit_index = N;
-            logger->info("Raft node {} advanced commit_index to {}", id, N);
-          }
-        }
-
-        // apply newly committed entries
-        while (this->last_applied < this->commit_index) {
-          this->last_applied += 1;
-          const auto &e = this->log_entries[this->last_applied];
-
-          ApplyResult result;
-          result.valid = true;
-          result.data = e.command();
-          result.index = e.index();
-          this->apply(result);
-          logger->info("Raft node {} applied committed entry index {} term {}", 
-            id, e.index(), e.term());
-        }
-      } else {
-        // backoff: use conflict_term/conflict_index, but don't regress past newer successes
-        uint64_t cf_term = reply.conflict_term();
-        uint64_t cf_index = reply.conflict_index();
-
-        uint64_t candidate_next;
-        if (cf_term == 0) {
-          // follower's log is too short: jump to its end
-          candidate_next = cf_index;
-        } else {
-          // find last index with conflict_term in our log
-          uint64_t new_next = cf_index;
-          for (uint64_t i = static_cast<uint64_t>(this->log_entries.size()); i-- > 1;) {
-            if (this->log_entries[i].term() == cf_term) {
-              new_next = i + 1;
-              break;
-            }
-          }
-          candidate_next = new_next;
-        }
-
-        if (candidate_next < 1) {
-          candidate_next = 1;
-        }
-
-        uint64_t old_next = this->next_index[target_id];
-        if (candidate_next < old_next) {
-          this->next_index[target_id] = candidate_next;
-          logger->info(
-              "Raft node {} backing off next_index for follower {} to {} based on conflict term {} and index {}",
-              id, target_id, this->next_index[target_id], cf_term, cf_index);
-        }
-      }
-    }).detach();
+    }
   }
 }
 
@@ -412,12 +625,14 @@ grpc::Status Raft::RaftServiceImpl::AppendEntries(
         raft_->current_term = request->term(); // update the current term and become follower
         raft_->role = Role::Follower;
         raft_->voted_for.reset();
-        raft_->logger->info("Raft node {} received heartbeat from leader {} and becoming follower", raft_->id, request->leader_id());
+        raft_->logger->debug("Raft node {} received heartbeat from leader {} and becoming follower",
+                            raft_->id, request->leader_id());
     }
     // heartbeat
     else if(request->term() == raft_->current_term) {
         raft_->role = Role::Follower; // if we are candidate then move to follower
-        raft_->logger->info("Raft node {} received heartbeat from leader {}", raft_->id, request->leader_id());
+        raft_->logger->debug("Raft node {} received heartbeat from leader {}", raft_->id,
+                             request->leader_id());
     }
     raft_->last_heartbeat = std::chrono::steady_clock::now();
 
@@ -431,8 +646,9 @@ grpc::Status Raft::RaftServiceImpl::AppendEntries(
     uint64_t prev_term = request->prev_log_term();
 
     if (prev_index > last_log_index()) { // if we are missing entry at prev_index, reject
-      raft_->logger->info("Raft node {} rejecting AppendEntries due to missing entry at index {} (last log index: {})", 
-        raft_->id, prev_index, last_log_index());
+      raft_->logger->debug(
+          "Raft node {} rejecting AppendEntries due to missing entry at index {} (last log index: {})",
+          raft_->id, prev_index, last_log_index());
       reply->set_term(raft_->current_term);
       reply->set_success(false);
       reply->set_conflict_term(0);
@@ -443,8 +659,10 @@ grpc::Status Raft::RaftServiceImpl::AppendEntries(
     if (prev_index > 0) { // if prev_index > 0, check that term matches
       const auto &prev_entry = raft_->log_entries[prev_index];
       if (prev_entry.term() != prev_term) {
-        raft_->logger->info("Raft node {} rejecting AppendEntries due to term mismatch at index {} (expected {}, got {}) (last log index: {})", 
-          raft_->id, prev_index, prev_term, prev_entry.term(), last_log_index());
+        raft_->logger->debug(
+            "Raft node {} rejecting AppendEntries due to term mismatch at index {} (expected {}, got "
+            "{}) (last log index: {})",
+            raft_->id, prev_index, prev_term, prev_entry.term(), last_log_index());
         uint64_t conflict_term = prev_entry.term();
         uint64_t conflict_index = prev_index;
         while(conflict_index > 1 && raft_->log_entries[conflict_index-1].term() == conflict_term) {
@@ -475,8 +693,8 @@ grpc::Status Raft::RaftServiceImpl::AppendEntries(
       e.set_term(incoming.term());
       e.set_index(incoming.index());
       e.set_command(incoming.command());
-      raft_->logger->info("Raft node {} appending log entry index {} term {} from leader {}",
-        raft_->id, incoming.index(), incoming.term(), request->leader_id());
+      raft_->logger->debug("Raft node {} appending log entry index {} term {} from leader {}",
+                           raft_->id, incoming.index(), incoming.term(), request->leader_id());
       raft_->log_entries.push_back(std::move(e));
     }
 
@@ -495,8 +713,8 @@ grpc::Status Raft::RaftServiceImpl::AppendEntries(
       result.valid = true;
       result.data = e.command();
       result.index = e.index(); // should equal last_applied
-      raft_->logger->info("Raft node {} applying committed entry index {} term {}",
-        raft_->id, e.index(), e.term());
+      raft_->logger->debug("Raft node {} applying committed entry index {} term {}", raft_->id,
+                           e.index(), e.term());
       raft_->apply(result);
     }
 

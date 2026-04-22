@@ -4,10 +4,14 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <string>
 #include <unordered_map>
 #include <chrono>
 #include <optional>
+#include <thread>
+#include <vector>
+#include <atomic>
 
 #include <grpcpp/grpcpp.h>
 
@@ -39,6 +43,11 @@ public:
 
   // lab3: sync propose
   ProposalResult propose_sync(const std::string &data);
+
+  // Leader ReadIndex barrier: quorum-confirmed AppendEntries in current term.
+  bool read_quorum_barrier(
+      std::chrono::milliseconds timeout = std::chrono::milliseconds(500));
+  uint64_t get_commit_index() const;
 
   // WARN: do not modify the signature
   void start_server();
@@ -121,7 +130,23 @@ private:
   std::chrono::milliseconds get_random_election_timeout();
 
   void send_heartbeats(uint64_t term);
+  void send_heartbeats(uint64_t term, uint64_t min_commit_index);
   void send_request_votes(uint64_t term);
+
+  // One AppendEntries RPC to a follower and full reply handling (replication +
+  // commit + apply). Returns true iff RPC succeeded and reply.success().
+  bool replicate_to_follower(uint64_t target_id, uint64_t term);
+
+  // Background replication (one worker per follower).
+  void start_replication_workers();
+  void replication_worker(uint64_t target_id);
+  void signal_replication();
+
+  std::atomic<bool> repl_started_{false};
+  std::mutex repl_mu_;
+  std::condition_variable repl_cv_;
+  std::atomic<uint64_t> repl_epoch_{0};
+  std::vector<std::thread> repl_workers_;
 
 };
 } // namespace rafty

@@ -1,8 +1,11 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 #include <grpcpp/grpcpp.h>
@@ -59,7 +62,7 @@ public:
   std::optional<OpResult> check_rifl_cache(uint64_t client_id, uint64_t seq_num) {
     std::lock_guard<std::mutex> lock(mu_);
     auto it = rifl_cache_.find(client_id);
-    if (it != rifl_cache_.end() && it->second.seq_num >= seq_num) {
+    if (it != rifl_cache_.end() && it->second.seq_num == seq_num) {
       return it->second.result;
     }
     return std::nullopt;
@@ -92,6 +95,8 @@ public:
           applied_results_[result.index] = {"", kvpb::KV_TIMEOUT};
         }
       }
+      last_kv_applied_up_to_.store(result.index, std::memory_order_release);
+      kv_applied_cv_.notify_all();
       return;
     }
     std::istringstream ss(result.data);
@@ -113,21 +118,22 @@ public:
       op_result = it->second.result;
     }
     else {
-      if (op == "PUT") {
+      if (op == "NOOP") {
+        op_result = {"", kvpb::KV_SUCCESS};
+      } else if (op == "PUT") {
         store_[key] = value;
         op_result = {"", kvpb::KV_SUCCESS};
-      }
-      else if (op == "APPEND") {
+        rifl_cache_[client_id] = {seq_num, op_result};
+      } else if (op == "APPEND") {
         store_[key] += value;
         op_result = {"", kvpb::KV_SUCCESS};
-      }
-      else if (op == "GET") {
+        rifl_cache_[client_id] = {seq_num, op_result};
+      } else if (op == "GET") {
         auto kit = store_.find(key);
         std::string val = (kit != store_.end()) ? kit->second : "";
         op_result = {val, kvpb::KV_SUCCESS};
+        rifl_cache_[client_id] = {seq_num, op_result};
       }
-
-      rifl_cache_[client_id] = {seq_num, op_result};
     }
 
     auto wit = waiters_.find(result.index);
@@ -141,6 +147,8 @@ public:
         applied_results_[result.index] = op_result;
       }
     }
+    last_kv_applied_up_to_.store(result.index, std::memory_order_release);
+    kv_applied_cv_.notify_all();
   }
 
   // -----------------------------------------------------------------
@@ -163,11 +171,6 @@ public:
                    kvpb::KvResponse *response) override {
     // TODO (lab 3): implement
     (void)context;
-
-    if(!raft_.get_state().is_leader) {
-      response->set_status(kvpb::KV_NOTLEADER);
-      return grpc::Status::OK;
-    }
 
     // RIFL duplicate detection: if already executed, return cached result.
     if (auto cached = check_rifl_cache(request->client_id(), request->seq_num())) {
@@ -218,29 +221,38 @@ public:
       return grpc::Status::OK;
     }
 
-    std::string op = "GET\t" + request->key() + "\t\t" +
-                   std::to_string(request->client_id()) +
-                   "\t" + std::to_string(request->seq_num());
-
-    auto proposal = raft_.propose(op);
-    if(!proposal.is_leader) {
+    if (!raft_.read_quorum_barrier(std::chrono::milliseconds(300))) {
       response->set_status(kvpb::KV_NOTLEADER);
       return grpc::Status::OK;
     }
 
-    auto fut = register_waiter(proposal.index);
+    const uint64_t commit_upto = raft_.get_commit_index();
 
-    if(fut.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
-      std::lock_guard<std::mutex> lock(mu_);
-      waiters_.erase(proposal.index);
-      abandoned_indices_.insert(proposal.index);
-      response->set_status(kvpb::KV_TIMEOUT);
-      return grpc::Status::OK;
+    const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (last_kv_applied_up_to_.load(std::memory_order_acquire) < commit_upto) {
+      if (std::chrono::steady_clock::now() >= wait_deadline) {
+        response->set_status(kvpb::KV_TIMEOUT);
+        return grpc::Status::OK;
+      }
+      if (!raft_.get_state().is_leader) {
+        response->set_status(kvpb::KV_NOTLEADER);
+        return grpc::Status::OK;
+      }
+
+      // Avoid calling into Raft from the CV predicate (extra locking per wakeup).
+      std::unique_lock<std::mutex> lk(kv_applied_wait_mu_);
+      (void)kv_applied_cv_.wait_until(lk, wait_deadline, [&] {
+        return last_kv_applied_up_to_.load(std::memory_order_acquire) >= commit_upto;
+      });
     }
 
-    auto op_result = fut.get();
+    std::lock_guard<std::mutex> lock(mu_);
+    auto kit = store_.find(request->key());
+    std::string val = (kit != store_.end()) ? kit->second : "";
+    OpResult op_result = {val, kvpb::KV_SUCCESS};
+    rifl_cache_[request->client_id()] = {request->seq_num(), op_result};
     response->set_status(op_result.status);
-    response->set_value(op_result.value);
+    response->set_value(val);
     return grpc::Status::OK;
   }
 
@@ -249,11 +261,6 @@ public:
                       kvpb::KvResponse *response) override {
     // TODO (lab 3): implement
     (void)context;
-
-    if(!raft_.get_state().is_leader) {
-      response->set_status(kvpb::KV_NOTLEADER);
-      return grpc::Status::OK;
-    }
 
     // RIFL duplicate detection: if already executed, return cached result.
     if (auto cached = check_rifl_cache(request->client_id(), request->seq_num())) {
@@ -296,6 +303,11 @@ private:
   std::unordered_map<uint64_t, std::promise<OpResult>> waiters_;
   std::unordered_map<uint64_t, OpResult> applied_results_;
   std::unordered_set<uint64_t> abandoned_indices_;
+
+  // Max Raft log index applied to store_/rifl (used to sync ReadIndex-style GETs).
+  std::atomic<uint64_t> last_kv_applied_up_to_{0};
+  std::mutex kv_applied_wait_mu_;
+  std::condition_variable kv_applied_cv_;
 
   // TODO (lab 3): add your state here. Consider:
   //
