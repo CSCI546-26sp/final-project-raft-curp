@@ -172,6 +172,11 @@ public:
     // TODO (lab 3): implement
     (void)context;
 
+    if (!raft_.get_state().is_leader) {
+      response->set_status(kvpb::KV_NOTLEADER);
+      return grpc::Status::OK;
+    }
+
     // RIFL duplicate detection: if already executed, return cached result.
     if (auto cached = check_rifl_cache(request->client_id(), request->seq_num())) {
       response->set_status(cached->status);
@@ -261,6 +266,11 @@ public:
                       kvpb::KvResponse *response) override {
     // TODO (lab 3): implement
     (void)context;
+
+    if (!raft_.get_state().is_leader) {
+      response->set_status(kvpb::KV_NOTLEADER);
+      return grpc::Status::OK;
+    }
 
     // RIFL duplicate detection: if already executed, return cached result.
     if (auto cached = check_rifl_cache(request->client_id(), request->seq_num())) {
