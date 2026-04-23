@@ -226,9 +226,11 @@ public:
       return grpc::Status::OK;
     }
 
-    if (!raft_.read_quorum_barrier(std::chrono::milliseconds(300))) {
-      response->set_status(kvpb::KV_NOTLEADER);
-      return grpc::Status::OK;
+    if (!raft_.has_valid_lease()) {
+      if (!raft_.read_quorum_barrier(std::chrono::milliseconds(300))) {
+        response->set_status(kvpb::KV_NOTLEADER);
+        return grpc::Status::OK;
+      }
     }
 
     const uint64_t commit_upto = raft_.get_commit_index();

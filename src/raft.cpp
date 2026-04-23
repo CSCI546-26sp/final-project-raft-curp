@@ -344,6 +344,7 @@ bool Raft::replicate_to_follower(uint64_t target_id, uint64_t term) {
       if (count >= majority && this->log_entries[N].term() == this->current_term) {
         this->commit_index = N;
         logger->debug("Raft node {} advanced commit_index to {}", id, N);
+        this->last_quorum_ack_ = std::chrono::steady_clock::now();
       }
     }
 
@@ -533,6 +534,13 @@ void Raft::send_heartbeats(uint64_t term, uint64_t min_commit_index) {
       }
     }
   }
+}
+
+bool Raft::has_valid_lease() const {
+  std::lock_guard<std::mutex> lock(mtx);
+  if (role != Role::Leader) return false;
+  auto elapsed = std::chrono::steady_clock::now() - last_quorum_ack_;
+  return elapsed < std::chrono::milliseconds(100);
 }
 
 void Raft::send_request_votes(uint64_t term) {

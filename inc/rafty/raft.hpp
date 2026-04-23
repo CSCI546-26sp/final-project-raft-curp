@@ -48,6 +48,8 @@ public:
   bool read_quorum_barrier(
       std::chrono::milliseconds timeout = std::chrono::milliseconds(500));
   uint64_t get_commit_index() const;
+  // Avoid quorum
+  bool has_valid_lease() const;
 
   // WARN: do not modify the signature
   void start_server();
@@ -98,6 +100,8 @@ private:
   std::unique_ptr<Server> server_;
 
   std::unique_ptr<RaftServiceImpl> grpcService; // grpc server instance
+
+  std::chrono::steady_clock::time_point last_quorum_ack_{};
 
   // Raft states
   enum class Role {
