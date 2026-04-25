@@ -310,6 +310,36 @@ public:
     return grpc::Status::OK;
   }
 
+  grpc::Status WitnessRecord(grpc::ServerContext *context,
+                             const kvpb::WitnessRecordRequest *request,
+                             kvpb::WitnessRecordReply *response) override {
+    (void)context;
+    auto res = raft_.witness_record(request->op_type(), request->key(),
+                                    request->value(), request->client_id(),
+                                    request->seq_num());
+    response->set_conflict(res.conflict);
+    response->set_witness_idx(res.witness_idx);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status
+  WitnessGetRecoveryData(grpc::ServerContext *context,
+                         const kvpb::WitnessGetRecoveryDataRequest *request,
+                         kvpb::WitnessGetRecoveryDataReply *response) override {
+    (void)context;
+    (void)request;
+    auto ops = raft_.witness_get_recovery_data();
+    for (const auto &op : ops) {
+      auto *o = response->add_ops();
+      o->set_op_type(op.op_type);
+      o->set_key(op.key);
+      o->set_value(op.value);
+      o->set_client_id(op.client_id);
+      o->set_seq_num(op.seq_num);
+    }
+    return grpc::Status::OK;
+  }
+
 private:
   rafty::Raft &raft_;
 

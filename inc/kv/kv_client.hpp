@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <random>
 #include <string>
@@ -76,6 +77,57 @@ public:
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return kvpb::KV_TIMEOUT;
+  }
+
+  // Attempt CURP fast-path witness recording: returns true if a superquorum of witnesses replied conflict-free
+  bool witness_superquorum_record(const std::string &op_type,
+                                  const std::string &key,
+                                  const std::string &value,
+                                  uint64_t client_id, uint64_t seq_num,
+                                  size_t required_ok = 4) {
+    if (stubs_.empty()) {
+      return false;
+    }
+
+    std::vector<std::future<std::optional<kvpb::WitnessRecordReply>>> futs;
+    futs.reserve(stubs_.size());
+
+    for (auto &stub : stubs_) {
+      futs.emplace_back(std::async(std::launch::async, [&stub, &op_type, &key, &value, client_id, seq_num]() {
+        kvpb::WitnessRecordRequest request;
+        request.set_op_type(op_type);
+        request.set_key(key);
+        request.set_value(value);
+        request.set_client_id(client_id);
+        request.set_seq_num(seq_num);
+
+        kvpb::WitnessRecordReply response;
+        grpc::ClientContext context;
+        context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(750));
+
+        auto status = stub->WitnessRecord(&context, request, &response);
+        if (!status.ok()) {
+          return std::optional<kvpb::WitnessRecordReply>{};
+        }
+        return std::optional<kvpb::WitnessRecordReply>(response);
+      }));
+    }
+
+    size_t ok = 0;
+    for (auto &f : futs) {
+      auto opt = f.get();
+      if (!opt.has_value()) {
+        continue;
+      }
+      if (opt->conflict()) {
+        return false;
+      }
+      ++ok;
+      if (ok >= required_ok) {
+        return true;
+      }
+    }
+    return false;
   }
 
   std::pair<kvpb::KvStatus, std::string> get(const std::string &key) {
