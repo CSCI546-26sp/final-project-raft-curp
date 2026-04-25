@@ -781,4 +781,65 @@ grpc::Status Raft::RaftServiceImpl::RequestVote(grpc::ServerContext *context,
     return grpc::Status::OK;
 }
 
+Raft::WitnessRecordResult Raft::witness_record(const std::string& op_type,
+                               const std::string& key,
+                               const std::string& value,
+                               uint64_t client_id,
+                               uint64_t seq_num) {
+  std::lock_guard<std::mutex> lock(this->mtx);
+
+  if(op_type != "GET") {
+    for(const auto & [idx, op] : unsynced_ops_) {
+      if (op.key == key) {
+        // Same key + at least one write = conflict, deny fast path
+        logger->debug("Raft node {} witness CONFLICT on key '{}' "
+                      "(existing op: {} by client {})",
+                      id, key, op.op_type, op.client_id);
+        return {true, 0};
+      }
+    }
+  }
+
+  uint64_t witness_idx = ++next_unsynced_index_;
+  unsynced_ops_[witness_idx] = UnsyncedOp{key, value, op_type, client_id, seq_num};
+  logger->debug("Raft node {} witness RECORD idx={} op={} key='{}' "
+                "client={} seq={}",
+                id, witness_idx, op_type, key, client_id, seq_num);
+  return {false, witness_idx};
+}
+
+void Raft::witness_gc(uint64_t up_to) {
+  std::lock_guard<std::mutex> lock(this->mtx);
+  auto it = unsynced_ops_.begin();
+  while (it != unsynced_ops_.end()) {
+    if (it->first <= up_to) {
+      logger->debug("Raft node {} witness GC idx={} key='{}'",
+                    id, it->first, it->second.key);
+      it = unsynced_ops_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+std::vector<Raft::UnsyncedOp> Raft::witness_get_recovery_data() {
+  std::lock_guard<std::mutex> lock(this->mtx);
+  std::vector<UnsyncedOp> result;
+  result.reserve(unsynced_ops_.size());
+  for (const auto& [idx, op] : unsynced_ops_) {
+    result.push_back(op);
+  }
+  return result;
+}
+
+bool Raft::witness_has_unsynced_write(const std::string& key) {
+  std::lock_guard<std::mutex> lock(this->mtx);
+  for (const auto& [idx, op] : unsynced_ops_) {
+    if (op.key == key && op.op_type != "GET") {
+      return true;
+    }
+  }
+  return false;
+}
+
 } // namespace rafty

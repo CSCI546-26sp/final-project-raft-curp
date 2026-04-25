@@ -11,7 +11,7 @@
 #include <optional>
 #include <thread>
 #include <vector>
-#include <atomic>
+#include <atomic> 
 
 #include <grpcpp/grpcpp.h>
 
@@ -58,6 +58,19 @@ public:
   bool is_dead() const;
   void kill();
 
+  struct WitnessRecordResult {
+    bool conflict;
+    uint64_t witness_idx;
+  };
+
+  WitnessRecordResult witness_record(const std::string& op_type,
+                               const std::string& key,
+                               const std::string& value,
+                               uint64_t client_id,
+                               uint64_t seq_num);
+
+  void witness_gc(uint64_t up_to);
+  
 private:
   // WARN: do not modify `create_context` and `apply`.
 
@@ -152,6 +165,22 @@ private:
   std::atomic<uint64_t> repl_epoch_{0};
   std::vector<std::thread> repl_workers_;
 
+  // CURP: unsynced witness ops
+  struct UnsyncedOp {
+    std::string key;
+    std::string value;
+    std::string op_type;
+    uint64_t client_id;
+    uint64_t seq_num;
+  };
+
+  // map from log index -> op (fast path ACK which are not yet in Raft)
+  std::unordered_map <uint64_t, UnsyncedOp> unsynced_ops_;
+  uint64_t next_unsynced_index_{0};
+
+public:
+  std::vector<UnsyncedOp> witness_get_recovery_data();
+  bool witness_has_unsynced_write(const std::string& key);
 };
 } // namespace rafty
 
