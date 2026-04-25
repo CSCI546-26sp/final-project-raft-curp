@@ -18,6 +18,7 @@
 #include <chrono>
 #include <optional>
 #include <unordered_set>
+#include <queue>
 
 namespace kv {
 
@@ -109,46 +110,50 @@ public:
     ss.ignore();
     ss >> seq_num;
 
-    std::lock_guard<std::mutex> lock(mu_);
-
     OpResult op_result;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
 
-    auto it = rifl_cache_.find(client_id);
-    if (it != rifl_cache_.end() && it->second.seq_num >= seq_num) {
-      op_result = it->second.result;
-    }
-    else {
-      if (op == "NOOP") {
-        op_result = {"", kvpb::KV_SUCCESS};
-      } else if (op == "PUT") {
-        store_[key] = value;
-        op_result = {"", kvpb::KV_SUCCESS};
-        rifl_cache_[client_id] = {seq_num, op_result};
-      } else if (op == "APPEND") {
-        store_[key] += value;
-        op_result = {"", kvpb::KV_SUCCESS};
-        rifl_cache_[client_id] = {seq_num, op_result};
-      } else if (op == "GET") {
-        auto kit = store_.find(key);
-        std::string val = (kit != store_.end()) ? kit->second : "";
-        op_result = {val, kvpb::KV_SUCCESS};
-        rifl_cache_[client_id] = {seq_num, op_result};
+      auto it = rifl_cache_.find(client_id);
+      if (it != rifl_cache_.end() && it->second.seq_num >= seq_num) {
+        op_result = it->second.result;
       }
-    }
+      else {
+        if (op == "NOOP") {
+          op_result = {"", kvpb::KV_SUCCESS};
+        } else if (op == "PUT") {
+          store_[key] = value;
+          op_result = {"", kvpb::KV_SUCCESS};
+          rifl_cache_[client_id] = {seq_num, op_result};
+        } else if (op == "APPEND") {
+          store_[key] += value;
+          op_result = {"", kvpb::KV_SUCCESS};
+          rifl_cache_[client_id] = {seq_num, op_result};
+        } else if (op == "GET") {
+          auto kit = store_.find(key);
+          std::string val = (kit != store_.end()) ? kit->second : "";
+          op_result = {val, kvpb::KV_SUCCESS};
+          rifl_cache_[client_id] = {seq_num, op_result};
+        }
+      }
 
-    auto wit = waiters_.find(result.index);
-    if(wit != waiters_.end()) {
-      wit->second.set_value(op_result);
-      waiters_.erase(wit);
-    } else {
-      // If the waiting RPC already timed out, don't retain a buffered result.
-      // We still applied to store_ and updated rifl_cache_ above.
-      if (abandoned_indices_.erase(result.index) == 0) {
-        applied_results_[result.index] = op_result;
+      auto wit = waiters_.find(result.index);
+      if(wit != waiters_.end()) {
+        wit->second.set_value(op_result);
+        waiters_.erase(wit);
+      } else if (fast_path_indices_.erase(result.index)) {
+        // SKIP DO NOTHING
+      } else {
+        // If the waiting RPC already timed out, don't retain a buffered result.
+        // We still applied to store_ and updated rifl_cache_ above.
+        if (abandoned_indices_.erase(result.index) == 0) {
+          applied_results_[result.index] = op_result;
+        }
       }
+      last_kv_applied_up_to_.store(result.index, std::memory_order_release);
+      kv_applied_cv_.notify_all();
     }
-    last_kv_applied_up_to_.store(result.index, std::memory_order_release);
-    kv_applied_cv_.notify_all();
+    raft_.witness_gc(result.index);
   }
 
   // -----------------------------------------------------------------
@@ -320,6 +325,9 @@ private:
   std::atomic<uint64_t> last_kv_applied_up_to_{0};
   std::mutex kv_applied_wait_mu_;
   std::condition_variable kv_applied_cv_;
+
+  std::unordered_set<uint64_t> fast_path_indices_;
+  std::queue<std::string>      proposal_queue_;
 
   // TODO (lab 3): add your state here. Consider:
   //
