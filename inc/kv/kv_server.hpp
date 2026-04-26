@@ -37,10 +37,36 @@ public:
   explicit KvServer(rafty::Raft &raft) : raft_(raft) {
     // TODO (lab 3): initialize your data structures here.
     // You may want to start background threads, set up condition variables, etc.
+    proposal_worker_ = std::thread([this]() {
+        while (!stopped_.load()) {
+            std::unique_lock<std::mutex> lk(proposal_mu_);
+            proposal_cv_.wait(lk, [this] {
+                return !proposal_queue_.empty() || stopped_.load();
+            });
+            while (!proposal_queue_.empty()) {
+                std::string op = std::move(proposal_queue_.front());
+                proposal_queue_.pop();
+                lk.unlock();
+
+                auto proposal = raft_.propose(op);
+                if (proposal.is_leader) {
+                    std::lock_guard<std::mutex> lock(mu_);
+                    fast_path_indices_.insert(proposal.index);
+                }
+
+                lk.lock();
+            }
+        }
+    });
   }
 
   ~KvServer() {
     // TODO (lab 3): clean up any background threads.
+    stopped_.store(true);
+    proposal_cv_.notify_all();
+    if (proposal_worker_.joinable()) {
+        proposal_worker_.join();
+    }
   }
 
   std::future<OpResult> register_waiter(uint64_t index){
@@ -153,7 +179,9 @@ public:
       last_kv_applied_up_to_.store(result.index, std::memory_order_release);
       kv_applied_cv_.notify_all();
     }
-    raft_.witness_gc(result.index);
+    if (raft_.has_unsynced_ops()) {
+      raft_.witness_gc(result.index);
+    }
   }
 
   // -----------------------------------------------------------------
@@ -358,6 +386,10 @@ private:
 
   std::unordered_set<uint64_t> fast_path_indices_;
   std::queue<std::string>      proposal_queue_;
+  std::mutex                   proposal_mu_;
+  std::condition_variable      proposal_cv_;
+  std::thread                  proposal_worker_;
+  std::atomic<bool>            stopped_{false};
 
   // TODO (lab 3): add your state here. Consider:
   //

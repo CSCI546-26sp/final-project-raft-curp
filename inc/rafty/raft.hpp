@@ -177,10 +177,12 @@ private:
   // map from log index -> op (fast path ACK which are not yet in Raft)
   std::unordered_map <uint64_t, UnsyncedOp> unsynced_ops_;
   uint64_t next_unsynced_index_{0};
+  mutable std::mutex witness_mtx_;
 
 public:
   std::vector<UnsyncedOp> witness_get_recovery_data();
   bool witness_has_unsynced_write(const std::string& key);
+  bool has_unsynced_ops() const;
 };
 } // namespace rafty
 

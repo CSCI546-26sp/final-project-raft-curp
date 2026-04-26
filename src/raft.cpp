@@ -786,7 +786,7 @@ Raft::WitnessRecordResult Raft::witness_record(const std::string& op_type,
                                const std::string& value,
                                uint64_t client_id,
                                uint64_t seq_num) {
-  std::lock_guard<std::mutex> lock(this->mtx);
+  std::lock_guard<std::mutex> lock(this->witness_mtx_);
 
   if(op_type != "GET") {
     for(const auto & [idx, op] : unsynced_ops_) {
@@ -809,7 +809,7 @@ Raft::WitnessRecordResult Raft::witness_record(const std::string& op_type,
 }
 
 void Raft::witness_gc(uint64_t up_to) {
-  std::lock_guard<std::mutex> lock(this->mtx);
+  std::lock_guard<std::mutex> lock(this->witness_mtx_);
   auto it = unsynced_ops_.begin();
   while (it != unsynced_ops_.end()) {
     if (it->first <= up_to) {
@@ -823,7 +823,7 @@ void Raft::witness_gc(uint64_t up_to) {
 }
 
 std::vector<Raft::UnsyncedOp> Raft::witness_get_recovery_data() {
-  std::lock_guard<std::mutex> lock(this->mtx);
+  std::lock_guard<std::mutex> lock(this->witness_mtx_);
   std::vector<UnsyncedOp> result;
   result.reserve(unsynced_ops_.size());
   for (const auto& [idx, op] : unsynced_ops_) {
@@ -833,13 +833,18 @@ std::vector<Raft::UnsyncedOp> Raft::witness_get_recovery_data() {
 }
 
 bool Raft::witness_has_unsynced_write(const std::string& key) {
-  std::lock_guard<std::mutex> lock(this->mtx);
+  std::lock_guard<std::mutex> lock(this->witness_mtx_);
   for (const auto& [idx, op] : unsynced_ops_) {
     if (op.key == key && op.op_type != "GET") {
       return true;
     }
   }
   return false;
+}
+
+bool Raft::has_unsynced_ops() const {
+    std::lock_guard<std::mutex> lock(this->witness_mtx_); // ← not mtx
+    return !unsynced_ops_.empty();
 }
 
 } // namespace rafty
