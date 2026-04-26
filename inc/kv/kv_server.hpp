@@ -375,7 +375,50 @@ public:
     // return grpc::Status::OK;
   }
 
+  grpc::Status Sync(grpc::ServerContext *context,
+                  const kvpb::SyncRequest *request,
+                  kvpb::SyncResponse *response) override {
+  (void)context;
 
+  if (!raft_.get_state().is_leader) {
+    response->set_status(kvpb::KV_NOTLEADER);
+    return grpc::Status::OK;
+  }
+
+  // Wait until this client's seq_num appears in rifl_cache_
+  // meaning on_apply() has processed and committed it to store_
+  const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+
+  while (true) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto it = rifl_cache_.find(request->client_id());
+      if (it != rifl_cache_.end() && it->second.seq_num >= request->seq_num()) {
+        // op has been committed and applied to store_
+        response->set_status(kvpb::KV_SUCCESS);
+        return grpc::Status::OK;
+      }
+    }
+
+    if (std::chrono::steady_clock::now() >= wait_deadline) {
+      response->set_status(kvpb::KV_TIMEOUT);
+      return grpc::Status::OK;
+    }
+
+    if (!raft_.get_state().is_leader) {
+      response->set_status(kvpb::KV_NOTLEADER);
+      return grpc::Status::OK;
+    }
+
+    // Wait for on_apply() to fire and update rifl_cache_
+    std::unique_lock<std::mutex> lk(kv_applied_wait_mu_);
+    kv_applied_cv_.wait_until(lk, wait_deadline, [&] {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto it = rifl_cache_.find(request->client_id());
+      return it != rifl_cache_.end() && it->second.seq_num >= request->seq_num();
+    });
+  }
+}
 
   grpc::Status WitnessRecord(grpc::ServerContext *context,
                              const kvpb::WitnessRecordRequest *request,
