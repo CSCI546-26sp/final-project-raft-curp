@@ -137,6 +137,24 @@ TEST_F(KvTestFixture, FastPathBasic) {
   ASSERT_EQ(val, "testvalue");
 }
 
+TEST_F(KvTestFixture, CurpFastPath) {
+  auto client = make_client();  // needs to connect to 5 nodes for witnesses
+
+  auto status = client->put_curp("key1", "hello");
+  ASSERT_EQ(status, kvpb::KV_SUCCESS);
+
+  auto [get_status, val] = client->get_curp("key1");
+  ASSERT_EQ(get_status, kvpb::KV_SUCCESS);
+  ASSERT_EQ(val, "hello");
+
+  status = client->append_curp("key1", " world");
+  ASSERT_EQ(status, kvpb::KV_SUCCESS);
+
+  auto [get_status2, val2] = client->get("key1");
+  ASSERT_EQ(get_status2, kvpb::KV_SUCCESS);
+  ASSERT_EQ(val2, "hello world");
+}
+
 // ---------------------------------------------------------------------------
 // Test: Basic Put/Get/Append operations
 // ---------------------------------------------------------------------------
