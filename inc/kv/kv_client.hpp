@@ -233,6 +233,26 @@ public:
     return kvpb::KV_TIMEOUT;
   }
 
+  kvpb::KvStatus sync(uint64_t client_id, uint64_t seq_num) {
+  for (int attempt = 0; attempt < max_attempts_; ++attempt) {
+    kvpb::SyncRequest request;
+    request.set_client_id(client_id);
+    request.set_seq_num(seq_num);
+
+    kvpb::SyncResponse response;
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + rpc_timeout_);
+
+    auto status = stubs_[leader_idx_]->Sync(&context, request, &response);
+    if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
+      return kvpb::KV_SUCCESS;
+    }
+    rotate_leader();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  return kvpb::KV_TIMEOUT;
+}
+
   uint64_t client_id() const { return client_id_; }
 
 private:
