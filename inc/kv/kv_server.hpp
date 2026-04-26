@@ -69,6 +69,14 @@ public:
     }
   }
 
+  void enqueue_fast_path_proposal(const std::string& op) {
+    {
+      std::lock_guard<std::mutex> lk(proposal_mu_);
+      proposal_queue_.push(op);
+    }
+    proposal_cv_.notify_one();
+  }
+
   std::future<OpResult> register_waiter(uint64_t index){
     std::lock_guard<std::mutex> lock(mu_);
 
@@ -220,25 +228,36 @@ public:
                       "\t" + std::to_string(request->client_id()) +
                       "\t" + std::to_string(request->seq_num());
 
-    auto proposal = raft_.propose(op);
-    if(!proposal.is_leader) {
-      response->set_status(kvpb::KV_NOTLEADER);
-      return grpc::Status::OK;
-    }
-
-    auto fut = register_waiter(proposal.index);
-
-    if(fut.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
+    // Always reply immediately — master never waits for Raft
+    {
       std::lock_guard<std::mutex> lock(mu_);
-      waiters_.erase(proposal.index);
-      abandoned_indices_.insert(proposal.index);
-      response->set_status(kvpb::KV_TIMEOUT);
-      return grpc::Status::OK;
+      rifl_cache_[request->client_id()] = {
+        request->seq_num(), {"", kvpb::KV_SUCCESS}
+      };
     }
-
-    auto op_result = fut.get();
-    response->set_status(op_result.status);
+    response->set_status(kvpb::KV_SUCCESS);
+    enqueue_fast_path_proposal(op);
     return grpc::Status::OK;
+
+    // auto proposal = raft_.propose(op);
+    // if(!proposal.is_leader) {
+    //   response->set_status(kvpb::KV_NOTLEADER);
+    //   return grpc::Status::OK;
+    // }
+
+    // auto fut = register_waiter(proposal.index);
+
+    // if(fut.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
+    //   std::lock_guard<std::mutex> lock(mu_);
+    //   waiters_.erase(proposal.index);
+    //   abandoned_indices_.insert(proposal.index);
+    //   response->set_status(kvpb::KV_TIMEOUT);
+    //   return grpc::Status::OK;
+    // }
+
+    // auto op_result = fut.get();
+    // response->set_status(op_result.status);
+    // return grpc::Status::OK;
   }
 
   grpc::Status Get(grpc::ServerContext *context,
@@ -317,25 +336,36 @@ public:
                       "\t" + std::to_string(request->client_id()) +
                       "\t" + std::to_string(request->seq_num());
 
-    auto proposal = raft_.propose(op);
-    if(!proposal.is_leader) {
-      response->set_status(kvpb::KV_NOTLEADER);
-      return grpc::Status::OK;
-    }
-
-    auto fut = register_waiter(proposal.index);
-
-    if(fut.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
+    // Always reply immediately — master never waits for Raft
+    {
       std::lock_guard<std::mutex> lock(mu_);
-      waiters_.erase(proposal.index);
-      abandoned_indices_.insert(proposal.index);
-      response->set_status(kvpb::KV_TIMEOUT);
-      return grpc::Status::OK;
+      rifl_cache_[request->client_id()] = {
+        request->seq_num(), {"", kvpb::KV_SUCCESS}
+      };
     }
-
-    auto op_result = fut.get();
-    response->set_status(op_result.status);
+    response->set_status(kvpb::KV_SUCCESS);
+    enqueue_fast_path_proposal(op);
     return grpc::Status::OK;
+
+    // auto proposal = raft_.propose(op);
+    // if(!proposal.is_leader) {
+    //   response->set_status(kvpb::KV_NOTLEADER);
+    //   return grpc::Status::OK;
+    // }
+
+    // auto fut = register_waiter(proposal.index);
+
+    // if(fut.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
+    //   std::lock_guard<std::mutex> lock(mu_);
+    //   waiters_.erase(proposal.index);
+    //   abandoned_indices_.insert(proposal.index);
+    //   response->set_status(kvpb::KV_TIMEOUT);
+    //   return grpc::Status::OK;
+    // }
+
+    // auto op_result = fut.get();
+    // response->set_status(op_result.status);
+    // return grpc::Status::OK;
   }
 
   grpc::Status WitnessRecord(grpc::ServerContext *context,

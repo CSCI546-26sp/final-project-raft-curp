@@ -8,6 +8,7 @@ service KvService {
   rpc Append(AppendRequest) returns (KvResponse) {}
   rpc WitnessRecord(WitnessRecordRequest) returns (WitnessRecordReply) {}
   rpc WitnessGetRecoveryData(WitnessGetRecoveryDataRequest) returns (WitnessGetRecoveryDataReply) {}
+  rpc Sync(SyncRequest) returns (SyncResponse) {}
 }
 
 enum KvStatus {
@@ -71,3 +72,13 @@ message WitnessOp {
 message WitnessGetRecoveryDataReply {
   repeated WitnessOp ops = 1;
 }
+
+message SyncRequest {
+  uint64 client_id = 1;
+  uint64 seq_num = 2;
+}
+
+message SyncResponse {
+  KvStatus status = 1;
+}
+
