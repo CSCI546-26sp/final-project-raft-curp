@@ -48,7 +48,12 @@ public:
                 proposal_queue_.pop();
                 lk.unlock();
 
+                fprintf(stderr, "[CURP] background proposing: %s\n", op.c_str());
+
                 auto proposal = raft_.propose(op);
+                fprintf(stderr, "[CURP] propose returned: is_leader=%d index=%lu\n",
+                    proposal.is_leader, proposal.index);
+
                 if (proposal.is_leader) {
                     std::lock_guard<std::mutex> lock(mu_);
                     fast_path_indices_.insert(proposal.index);
@@ -115,6 +120,8 @@ public:
   //   4. Notify the waiting RPC handler that its operation has committed
   // -----------------------------------------------------------------
   void on_apply(const rafty::ApplyResult &result) {
+    fprintf(stderr, "[CURP] on_apply index=%lu valid=%d data=%s\n",
+            result.index, result.valid, result.data.c_str());
     // TODO (lab 3): implement this.
     if(!result.valid) {
       std::lock_guard<std::mutex> lock(mu_);
@@ -229,12 +236,12 @@ public:
                       "\t" + std::to_string(request->seq_num());
 
     // Always reply immediately — master never waits for Raft
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      rifl_cache_[request->client_id()] = {
-        request->seq_num(), {"", kvpb::KV_SUCCESS}
-      };
-    }
+    // {
+    //   std::lock_guard<std::mutex> lock(mu_);
+    //   rifl_cache_[request->client_id()] = {
+    //     request->seq_num(), {"", kvpb::KV_SUCCESS}
+    //   };
+    // }
     response->set_status(kvpb::KV_SUCCESS);
     enqueue_fast_path_proposal(op);
     return grpc::Status::OK;
@@ -337,12 +344,12 @@ public:
                       "\t" + std::to_string(request->seq_num());
 
     // Always reply immediately — master never waits for Raft
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      rifl_cache_[request->client_id()] = {
-        request->seq_num(), {"", kvpb::KV_SUCCESS}
-      };
-    }
+    // {
+    //   std::lock_guard<std::mutex> lock(mu_);
+    //   rifl_cache_[request->client_id()] = {
+    //     request->seq_num(), {"", kvpb::KV_SUCCESS}
+    //   };
+    // }
     response->set_status(kvpb::KV_SUCCESS);
     enqueue_fast_path_proposal(op);
     return grpc::Status::OK;
@@ -367,6 +374,8 @@ public:
     // response->set_status(op_result.status);
     // return grpc::Status::OK;
   }
+
+
 
   grpc::Status WitnessRecord(grpc::ServerContext *context,
                              const kvpb::WitnessRecordRequest *request,

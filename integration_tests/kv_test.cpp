@@ -121,6 +121,22 @@ protected:
   std::vector<std::string> kv_addrs;
 };
 
+TEST_F(KvTestFixture, FastPathBasic) {
+  auto client = make_client();
+
+  // Put a value
+  auto put_status = client->put("testkey", "testvalue");
+  ASSERT_EQ(put_status, kvpb::KV_SUCCESS);
+
+  // Wait for background Raft proposal to commit
+  std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+
+  // Get should return the value
+  auto [get_status, val] = client->get("testkey");
+  ASSERT_EQ(get_status, kvpb::KV_SUCCESS);
+  ASSERT_EQ(val, "testvalue");
+}
+
 // ---------------------------------------------------------------------------
 // Test: Basic Put/Get/Append operations
 // ---------------------------------------------------------------------------
