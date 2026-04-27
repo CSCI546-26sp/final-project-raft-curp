@@ -17,23 +17,6 @@
 
 namespace kv {
 
-// ---------------------------------------------------------------------------
-// KvClient is a fault-tolerant client for the KV service.
-//
-// It maintains stubs to all replicas and automatically retries operations
-// when it encounters KV_NOTLEADER (rotating to the next replica) or
-// transient gRPC failures.
-//
-// Each KvClient instance has a unique random client_id and a monotonically
-// increasing seq_num, implementing the client side of RIFL.
-//
-// Usage:
-//   std::vector<std::string> addrs = {"localhost:51050", "localhost:51051", "localhost:51052"};
-//   kv::KvClient client(addrs);
-//   client.put("key", "value");
-//   auto [status, val] = client.get("key");
-//   client.append("key", " more");
-// ---------------------------------------------------------------------------
 class KvClient {
 public:
   explicit KvClient(const std::vector<std::string> &addrs) : leader_idx_(0) {
@@ -65,29 +48,26 @@ public:
 
       kvpb::KvResponse response;
       grpc::ClientContext context;
-      context.set_deadline(std::chrono::system_clock::now() +
-                           rpc_timeout_);
+      context.set_deadline(std::chrono::system_clock::now() + rpc_timeout_);
 
       auto status = stubs_[leader_idx_]->Put(&context, request, &response);
       if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
         return kvpb::KV_SUCCESS;
       }
-      // KV_NOTLEADER, KV_TIMEOUT, or gRPC failure — rotate to next node
       rotate_leader();
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return kvpb::KV_TIMEOUT;
   }
 
-  // CURP-style PUT: try witness superquorum first, then call the existing
-  // leader RPC (slow path). If the leader returns early when witnesses
-  // succeeded, this becomes the 1-RTT path.
   kvpb::KvStatus put_curp(const std::string &key, const std::string &value) {
     uint64_t seq = ++seq_num_;
 
     auto witness_fut = std::async(std::launch::async, [&]() {
-      return witness_superquorum_record("PUT", key, value, client_id_, seq, 2);
+      return witness_superquorum_record("PUT", key, value, client_id_, seq, 4);
     });
+
+    kvpb::KvStatus leader_status = kvpb::KV_TIMEOUT;
 
     for (int attempt = 0; attempt < max_attempts_; ++attempt) {
       kvpb::PutRequest request;
@@ -99,23 +79,33 @@ public:
       kvpb::KvResponse response;
       grpc::ClientContext context;
       context.set_deadline(std::chrono::system_clock::now() + rpc_timeout_);
+
       auto status = stubs_[leader_idx_]->Put(&context, request, &response);
 
-      bool witnesses_ok = witness_fut.get();
-
       if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
-        if(witnesses_ok){
-          return kvpb::KV_SUCCESS;
-        }
-        return sync_latest();
+        leader_status = kvpb::KV_SUCCESS;
+        break;
       }
+
       rotate_leader();
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+
+    bool witnesses_ok = witness_fut.get();
+
+    if (leader_status == kvpb::KV_SUCCESS) {
+      if (witnesses_ok) {
+        fast_path_hits_.fetch_add(1, std::memory_order_relaxed);
+        return kvpb::KV_SUCCESS;
+      }
+      slow_path_hits_.fetch_add(1, std::memory_order_relaxed);
+      return sync_latest();
+    }
+
+    slow_path_hits_.fetch_add(1, std::memory_order_relaxed);
     return kvpb::KV_TIMEOUT;
   }
 
-  // Attempt CURP fast-path witness recording: returns true if a superquorum of witnesses replied conflict-free
   bool witness_superquorum_record(const std::string &op_type,
                                   const std::string &key,
                                   const std::string &value,
@@ -129,7 +119,8 @@ public:
     futs.reserve(stubs_.size());
 
     for (auto &stub : stubs_) {
-      futs.emplace_back(std::async(std::launch::async, [&stub, &op_type, &key, &value, client_id, seq_num]() {
+      futs.emplace_back(std::async(std::launch::async,
+          [&stub, &op_type, &key, &value, client_id, seq_num]() {
         kvpb::WitnessRecordRequest request;
         request.set_op_type(op_type);
         request.set_key(key);
@@ -139,7 +130,8 @@ public:
 
         kvpb::WitnessRecordReply response;
         grpc::ClientContext context;
-        context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(750));
+        context.set_deadline(std::chrono::system_clock::now() +
+                             std::chrono::milliseconds(750));
 
         auto status = stub->WitnessRecord(&context, request, &response);
         if (!status.ok()) {
@@ -176,14 +168,12 @@ public:
 
       kvpb::GetResponse response;
       grpc::ClientContext context;
-      context.set_deadline(std::chrono::system_clock::now() +
-                           rpc_timeout_);
+      context.set_deadline(std::chrono::system_clock::now() + rpc_timeout_);
 
       auto status = stubs_[leader_idx_]->Get(&context, request, &response);
       if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
         return {kvpb::KV_SUCCESS, response.value()};
       }
-      // KV_NOTLEADER, KV_TIMEOUT, or gRPC failure — rotate to next node
       rotate_leader();
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -191,19 +181,18 @@ public:
   }
 
   std::pair<kvpb::KvStatus, std::string> get_curp(const std::string &key) {
-    // Check any witness for unsynced write on this key
     bool has_conflict = false;
     for (auto &stub : stubs_) {
       kvpb::WitnessRecordRequest request;
       request.set_op_type("GET");
       request.set_key(key);
       request.set_client_id(client_id_);
-      request.set_seq_num(seq_num_); // don't increment — this is just a check
+      request.set_seq_num(seq_num_);
 
       kvpb::WitnessRecordReply response;
       grpc::ClientContext context;
       context.set_deadline(std::chrono::system_clock::now() +
-                          std::chrono::milliseconds(750));
+                           std::chrono::milliseconds(750));
 
       auto status = stub->WitnessRecord(&context, request, &response);
       if (status.ok() && response.conflict()) {
@@ -213,12 +202,12 @@ public:
     }
 
     if (has_conflict) {
-      // unsynced write on this key — wait for it to commit before reading
       auto s = sync_latest();
-      if (s != kvpb::KV_SUCCESS) return {kvpb::KV_TIMEOUT, ""};
+      if (s != kvpb::KV_SUCCESS) {
+        return {kvpb::KV_TIMEOUT, ""};
+      }
     }
 
-    // safe to read — do normal get
     uint64_t seq = ++seq_num_;
     for (int attempt = 0; attempt < max_attempts_; ++attempt) {
       kvpb::GetRequest request;
@@ -251,15 +240,12 @@ public:
 
       kvpb::KvResponse response;
       grpc::ClientContext context;
-      context.set_deadline(std::chrono::system_clock::now() +
-                           rpc_timeout_);
+      context.set_deadline(std::chrono::system_clock::now() + rpc_timeout_);
 
-      auto status =
-          stubs_[leader_idx_]->Append(&context, request, &response);
+      auto status = stubs_[leader_idx_]->Append(&context, request, &response);
       if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
         return kvpb::KV_SUCCESS;
       }
-      // KV_NOTLEADER, KV_TIMEOUT, or gRPC failure — rotate to next node
       rotate_leader();
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -268,9 +254,12 @@ public:
 
   kvpb::KvStatus append_curp(const std::string &key, const std::string &value) {
     uint64_t seq = ++seq_num_;
+
     auto witness_fut = std::async(std::launch::async, [&]() {
-      return witness_superquorum_record("APPEND", key, value, client_id_, seq, 2);
+      return witness_superquorum_record("APPEND", key, value, client_id_, seq, 4);
     });
+
+    kvpb::KvStatus leader_status = kvpb::KV_TIMEOUT;
 
     for (int attempt = 0; attempt < max_attempts_; ++attempt) {
       kvpb::AppendRequest request;
@@ -282,41 +271,57 @@ public:
       kvpb::KvResponse response;
       grpc::ClientContext context;
       context.set_deadline(std::chrono::system_clock::now() + rpc_timeout_);
+
       auto status = stubs_[leader_idx_]->Append(&context, request, &response);
 
-      bool witnesses_ok = witness_fut.get();
-
       if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
-        if(witnesses_ok) {
-          return kvpb::KV_SUCCESS;
-        }
-        return sync_latest();
+        leader_status = kvpb::KV_SUCCESS;
+        break;
       }
+
       rotate_leader();
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+
+    bool witnesses_ok = witness_fut.get();
+
+    if (leader_status == kvpb::KV_SUCCESS) {
+      if (witnesses_ok) {
+        fast_path_hits_.fetch_add(1, std::memory_order_relaxed);
+        return kvpb::KV_SUCCESS;
+      }
+      slow_path_hits_.fetch_add(1, std::memory_order_relaxed);
+      return sync_latest();
+    }
+
+    slow_path_hits_.fetch_add(1, std::memory_order_relaxed);
     return kvpb::KV_TIMEOUT;
   }
 
-  // UNUSED -- added sync_latest instead
-  kvpb::KvStatus sync(uint64_t client_id, uint64_t seq_num) {
-    for (int attempt = 0; attempt < max_attempts_; ++attempt) {
-      kvpb::SyncRequest request;
-      request.set_client_id(client_id);
-      request.set_seq_num(seq_num);
+  uint64_t fast_path_hits() const {
+    return fast_path_hits_.load(std::memory_order_relaxed);
+  }
 
-      kvpb::SyncResponse response;
-      grpc::ClientContext context;
-      context.set_deadline(std::chrono::system_clock::now() + rpc_timeout_);
+  uint64_t slow_path_hits() const {
+    return slow_path_hits_.load(std::memory_order_relaxed);
+  }
 
-      auto status = stubs_[leader_idx_]->Sync(&context, request, &response);
-      if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
-        return kvpb::KV_SUCCESS;
-      }
-      rotate_leader();
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  uint64_t total_write_ops() const {
+    return fast_path_hits() + slow_path_hits();
+  }
+
+  double fast_path_hit_rate() const {
+    uint64_t total = total_write_ops();
+    if (total == 0) {
+      return 0.0;
     }
-    return kvpb::KV_TIMEOUT;
+    return static_cast<double>(fast_path_hits()) /
+           static_cast<double>(total);
+  }
+
+  void reset_stats() {
+    fast_path_hits_.store(0, std::memory_order_relaxed);
+    slow_path_hits_.store(0, std::memory_order_relaxed);
   }
 
   kvpb::KvStatus sync_latest() {
@@ -331,7 +336,9 @@ public:
       context.set_deadline(std::chrono::system_clock::now() + rpc_timeout_);
 
       auto status = stubs_[leader_idx_]->Get(&context, request, &response);
-      if (status.ok()) return kvpb::KV_SUCCESS;
+      if (status.ok()) {
+        return kvpb::KV_SUCCESS;
+      }
       rotate_leader();
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -349,6 +356,9 @@ private:
   uint64_t client_id_;
   std::atomic<uint64_t> seq_num_;
   size_t leader_idx_;
+
+  std::atomic<uint64_t> fast_path_hits_{0};
+  std::atomic<uint64_t> slow_path_hits_{0};
 
   static constexpr int max_attempts_ = 50;
   static constexpr std::chrono::seconds rpc_timeout_{5};
