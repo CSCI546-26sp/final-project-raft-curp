@@ -76,6 +76,8 @@ public:
   void set_on_become_leader(std::function<void(uint64_t)> cb);
   uint64_t get_current_term() const;
   uint64_t get_id() const;
+  std::string get_listening_addr() const;
+  std::map<uint64_t, std::string> get_peer_addrs() const;
   
 private:
   // WARN: do not modify `create_context` and `apply`.
@@ -194,6 +196,7 @@ public:
   void witness_enter_recovery();
   void witness_exit_recovery();
   bool witness_in_recovery() const;
+  void witness_clear();
 };
 } // namespace rafty
 

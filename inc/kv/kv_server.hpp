@@ -443,6 +443,8 @@ public:
                          kvpb::WitnessGetRecoveryDataReply *response) override {
     (void)context;
     (void)request;
+    // Freeze witness for recovery: reject new WitnessRecord until explicitly ended.
+    raft_.witness_enter_recovery();
     auto ops = raft_.witness_get_recovery_data();
     for (const auto &op : ops) {
       auto *o = response->add_ops();
@@ -455,35 +457,155 @@ public:
     return grpc::Status::OK;
   }
 
-  void on_become_leader(uint64_t term) {
-    // Freeze witness: reject new WitnessRecord while recovering.
-    raft_.witness_enter_recovery();
+  grpc::Status WitnessEndRecovery(grpc::ServerContext *context,
+                                 const kvpb::WitnessEndRecoveryRequest *request,
+                                 kvpb::WitnessEndRecoveryReply *response) override {
+    (void)context;
+    if (request->clear()) {
+      raft_.witness_clear();
+    }
+    raft_.witness_exit_recovery();
+    response->set_status(kvpb::KV_SUCCESS);
+    return grpc::Status::OK;
+  }
 
-    // Pull local witness ops and replay.
-    auto ops = raft_.witness_get_recovery_data();
-    for (const auto &op : ops) {
-      if (op.op_type == "PUT" || op.op_type == "APPEND") {
-        std::string data = op.op_type + "\t" + op.key + "\t" + op.value + "\t" +
-                           std::to_string(op.client_id) + "\t" +
-                           std::to_string(op.seq_num);
+  void on_become_leader(uint64_t term) {
+    // Quorum recovery: freeze a quorum of witnesses (WitnessGetRecoveryData),
+    // replay recovered ops into Raft, then unfreeze/reset witnesses.
+    auto parse_port = [](const std::string &addr) -> std::optional<uint64_t> {
+      auto pos = addr.rfind(':');
+      if (pos == std::string::npos || pos + 1 >= addr.size()) {
+        return std::nullopt;
+      }
+      try {
+        return static_cast<uint64_t>(std::stoull(addr.substr(pos + 1)));
+      } catch (...) {
+        return std::nullopt;
+      }
+    };
+    auto host_part = [](const std::string &addr) -> std::string {
+      auto pos = addr.rfind(':');
+      if (pos == std::string::npos) return addr;
+      return addr.substr(0, pos);
+    };
+
+    const auto raft_addr = raft_.get_listening_addr();
+    const auto raft_port_opt = parse_port(raft_addr);
+    if (!raft_port_opt.has_value()) {
+      return;
+    }
+    const uint64_t kv_port = *raft_port_opt + 1000;
+    const std::string self_kv_addr = host_part(raft_addr) + ":" + std::to_string(kv_port);
+
+    std::vector<std::string> witness_kv_addrs;
+    witness_kv_addrs.push_back(self_kv_addr);
+    for (const auto &[pid, paddr] : raft_.get_peer_addrs()) {
+      (void)pid;
+      auto pport_opt = parse_port(paddr);
+      if (!pport_opt.has_value()) continue;
+      witness_kv_addrs.push_back(host_part(paddr) + ":" +
+                                 std::to_string(*pport_opt + 1000));
+    }
+
+    const size_t n = witness_kv_addrs.size();
+    const size_t quorum = (n / 2) + 1;
+
+    struct RecoveryResp {
+      std::string addr;
+      bool ok{false};
+      kvpb::WitnessGetRecoveryDataReply reply;
+    };
+
+    auto fetch_one = [](const std::string &addr) -> RecoveryResp {
+      RecoveryResp out;
+      out.addr = addr;
+      auto channel =
+          grpc::CreateChannel(addr, grpc::InsecureChannelCredentials());
+      auto stub = kvpb::KvService::NewStub(channel);
+      grpc::ClientContext ctx;
+      ctx.set_deadline(std::chrono::system_clock::now() +
+                       std::chrono::milliseconds(250));
+      kvpb::WitnessGetRecoveryDataRequest req;
+      kvpb::WitnessGetRecoveryDataReply rep;
+      auto st = stub->WitnessGetRecoveryData(&ctx, req, &rep);
+      out.ok = st.ok();
+      out.reply = std::move(rep);
+      return out;
+    };
+
+    std::vector<std::future<RecoveryResp>> futs;
+    futs.reserve(witness_kv_addrs.size());
+    for (const auto &addr : witness_kv_addrs) {
+      futs.push_back(std::async(std::launch::async, fetch_one, addr));
+    }
+
+    std::vector<RecoveryResp> got;
+    got.reserve(quorum);
+    for (auto &f : futs) {
+      auto r = f.get();
+      if (r.ok) {
+        got.push_back(std::move(r));
+        if (got.size() >= quorum) break;
+      }
+    }
+
+    // If we couldn't freeze a quorum, do nothing (next leader will retry).
+    if (got.size() < quorum) {
+      return;
+    }
+
+    // Pick a canonical recovery set: use the first successful witness's list.
+    // (Matches CURP intuition: replay from one consistent witness table.)
+    std::vector<kvpb::WitnessOp> to_replay;
+    for (const auto &op : got.front().reply.ops()) {
+      to_replay.push_back(op);
+    }
+
+    for (const auto &op : to_replay) {
+      if (op.op_type() == "PUT" || op.op_type() == "APPEND") {
+        std::string data = op.op_type() + "\t" + op.key() + "\t" + op.value() +
+                           "\t" + std::to_string(op.client_id()) + "\t" +
+                           std::to_string(op.seq_num());
         this->enqueue_fast_path_proposal(data);
       }
     }
 
-    // Wait (bounded) for witness ops to drain as commits apply + GC runs.
+    // Wait bounded for replayed ops to apply (RIFL dedups committed ops).
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (raft_.has_unsynced_ops() &&
-           std::chrono::steady_clock::now() < deadline) {
-      // If leadership changed mid-recovery, stop waiting and let next leader recover.
-      if (!raft_.get_state().is_leader || raft_.get_current_term() != term) {
-        break;
+    for (const auto &op : to_replay) {
+      while (std::chrono::steady_clock::now() < deadline) {
+        if (!raft_.get_state().is_leader || raft_.get_current_term() != term) {
+          break;
+        }
+        {
+          std::lock_guard<std::mutex> lock(mu_);
+          auto it = rifl_cache_.find(op.client_id());
+          if (it != rifl_cache_.end() && it->second.seq_num >= op.seq_num()) {
+            break;
+          }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
-    // Unfreeze witness (clients may proceed again).
-    raft_.witness_exit_recovery();
+    auto end_one = [](const std::string &addr) {
+      auto channel =
+          grpc::CreateChannel(addr, grpc::InsecureChannelCredentials());
+      auto stub = kvpb::KvService::NewStub(channel);
+      grpc::ClientContext ctx;
+      ctx.set_deadline(std::chrono::system_clock::now() +
+                       std::chrono::milliseconds(250));
+      kvpb::WitnessEndRecoveryRequest req;
+      req.set_clear(true);
+      kvpb::WitnessEndRecoveryReply rep;
+      (void)stub->WitnessEndRecovery(&ctx, req, &rep);
+    };
+
+    // Unfreeze/reset the witnesses we froze (best-effort).
+    for (const auto &r : got) {
+      end_one(r.addr);
+    }
   }
 
 private:

@@ -8,6 +8,8 @@ service KvService {
   rpc Append(AppendRequest) returns (KvResponse) {}
   rpc WitnessRecord(WitnessRecordRequest) returns (WitnessRecordReply) {}
   rpc WitnessGetRecoveryData(WitnessGetRecoveryDataRequest) returns (WitnessGetRecoveryDataReply) {}
+  // Exit witness recovery mode and optionally clear witness state.
+  rpc WitnessEndRecovery(WitnessEndRecoveryRequest) returns (WitnessEndRecoveryReply) {}
   rpc Sync(SyncRequest) returns (SyncResponse) {}
 }
 
@@ -71,6 +73,14 @@ message WitnessOp {
 
 message WitnessGetRecoveryDataReply {
   repeated WitnessOp ops = 1;
+}
+
+message WitnessEndRecoveryRequest {
+  bool clear = 1; // if true, drop all witness records
+}
+
+message WitnessEndRecoveryReply {
+  KvStatus status = 1;
 }
 
 message SyncRequest {

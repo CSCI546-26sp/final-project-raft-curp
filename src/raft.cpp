@@ -59,6 +59,12 @@ uint64_t Raft::get_current_term() const {
 
 uint64_t Raft::get_id() const { return this->id; }
 
+std::string Raft::get_listening_addr() const { return this->listening_addr; }
+
+std::map<uint64_t, std::string> Raft::get_peer_addrs() const {
+  return this->peer_addrs;
+}
+
 void Raft::signal_replication() {
   {
     std::lock_guard<std::mutex> lk(this->repl_mu_);
@@ -890,6 +896,12 @@ void Raft::witness_exit_recovery() {
 bool Raft::witness_in_recovery() const {
   std::lock_guard<std::mutex> lock(this->witness_mtx_);
   return this->witness_recovery_mode_;
+}
+
+void Raft::witness_clear() {
+  std::lock_guard<std::mutex> lock(this->witness_mtx_);
+  unsynced_ops_.clear();
+  next_unsynced_index_ = 1;
 }
 
 } // namespace rafty
