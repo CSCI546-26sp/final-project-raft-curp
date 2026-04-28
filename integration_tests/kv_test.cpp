@@ -376,6 +376,59 @@ TEST_F(KvTestFixture, PutOverwriteC) {
   auto [s3, v3] = client->get("overwrite");
   ASSERT_EQ(v3, "v3");
 }
+TEST_F(KvTestFixture, RttFastPath) {
+  auto client = make_client();
+
+  auto start = std::chrono::steady_clock::now();
+  auto status = client->put_curp("rtt_key", "value1");
+  auto end = std::chrono::steady_clock::now();
+  ASSERT_EQ(status, kvpb::KV_SUCCESS);
+
+  double put_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(end - start).count();
+  logger->info("RttFastPath: put_curp took {:.2f}ms (expected ~1 RTT)", put_ms);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+  start = std::chrono::steady_clock::now();
+  auto [get_status, val] = client->get("rtt_key");
+  end = std::chrono::steady_clock::now();
+
+  double get_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(end - start).count();
+  logger->info("RttFastPath: get took {:.2f}ms (expected ~1 RTT)", get_ms);
+
+  ASSERT_EQ(get_status, kvpb::KV_SUCCESS);
+  ASSERT_EQ(val, "value1");
+
+  std::cout << "put_curp latency: " << put_ms << "ms\n";
+  std::cout << "get latency (after sleep): " << get_ms << "ms\n";
+}
+
+TEST_F(KvTestFixture, RttSlowPath) {
+  auto client = make_client();
+
+  auto start = std::chrono::steady_clock::now();
+  auto status = client->put_curp("rtt_key2", "value2");
+  auto put_end = std::chrono::steady_clock::now();
+  ASSERT_EQ(status, kvpb::KV_SUCCESS);
+
+  auto [get_status, val] = client->get_curp("rtt_key2");
+  auto get_end = std::chrono::steady_clock::now();
+
+  double put_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(put_end - start).count();
+  double total_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(get_end - start).count();
+  double get_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(get_end - put_end).count();
+
+  logger->info("RttSlowPath: put_curp took {:.2f}ms", put_ms);
+  logger->info("RttSlowPath: get_curp took {:.2f}ms which includes sync if there's conflict", get_ms);
+  logger->info("RttSlowPath: total took {:.2f}ms (expected ~2 RTT)", total_ms);
+
+  ASSERT_EQ(get_status, kvpb::KV_SUCCESS);
+  ASSERT_EQ(val, "value2");
+
+  std::cout << "put_curp latency: " << put_ms << "ms\n";
+  std::cout << "get_curp latency (no sleep, may trigger sync): " << get_ms << "ms\n";
+  std::cout << "total latency: " << total_ms << "ms\n";
+}
 
 // ---------------------------------------------------------------------------
 // main
