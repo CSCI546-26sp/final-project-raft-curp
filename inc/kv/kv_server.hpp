@@ -63,6 +63,11 @@ public:
             }
         }
     });
+
+    // recovery trigger: when this node becomes leader, freeze witness
+    // and replay pending witness ops into Raft before serving new requests.
+    raft_.set_on_become_leader(
+        [this](uint64_t term) { this->on_become_leader(term); });
   }
 
   ~KvServer() {
@@ -448,6 +453,37 @@ public:
       o->set_seq_num(op.seq_num);
     }
     return grpc::Status::OK;
+  }
+
+  void on_become_leader(uint64_t term) {
+    // Freeze witness: reject new WitnessRecord while recovering.
+    raft_.witness_enter_recovery();
+
+    // Pull local witness ops and replay.
+    auto ops = raft_.witness_get_recovery_data();
+    for (const auto &op : ops) {
+      if (op.op_type == "PUT" || op.op_type == "APPEND") {
+        std::string data = op.op_type + "\t" + op.key + "\t" + op.value + "\t" +
+                           std::to_string(op.client_id) + "\t" +
+                           std::to_string(op.seq_num);
+        this->enqueue_fast_path_proposal(data);
+      }
+    }
+
+    // Wait (bounded) for witness ops to drain as commits apply + GC runs.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (raft_.has_unsynced_ops() &&
+           std::chrono::steady_clock::now() < deadline) {
+      // If leadership changed mid-recovery, stop waiting and let next leader recover.
+      if (!raft_.get_state().is_leader || raft_.get_current_term() != term) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    // Unfreeze witness (clients may proceed again).
+    raft_.witness_exit_recovery();
   }
 
 private:

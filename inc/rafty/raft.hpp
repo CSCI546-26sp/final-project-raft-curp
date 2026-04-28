@@ -70,6 +70,12 @@ public:
                                uint64_t seq_num);
 
   void witness_gc(uint64_t up_to);
+
+  // register a callback invoked when this node becomes leader
+  // the callback must be non-blocking & will run on the votehandling thread right after leader transition
+  void set_on_become_leader(std::function<void(uint64_t)> cb);
+  uint64_t get_current_term() const;
+  uint64_t get_id() const;
   
 private:
   // WARN: do not modify `create_context` and `apply`.
@@ -115,6 +121,7 @@ private:
   std::unique_ptr<RaftServiceImpl> grpcService; // grpc server instance
 
   std::chrono::steady_clock::time_point last_quorum_ack_{};
+  std::function<void(uint64_t)> on_become_leader_{};
 
   // Raft states
   enum class Role {
@@ -178,11 +185,15 @@ private:
   std::unordered_map <uint64_t, UnsyncedOp> unsynced_ops_;
   uint64_t next_unsynced_index_{0};
   mutable std::mutex witness_mtx_;
+  bool witness_recovery_mode_{false};
 
 public:
   std::vector<UnsyncedOp> witness_get_recovery_data();
   bool witness_has_unsynced_write(const std::string& key);
   bool has_unsynced_ops() const;
+  void witness_enter_recovery();
+  void witness_exit_recovery();
+  bool witness_in_recovery() const;
 };
 } // namespace rafty
 

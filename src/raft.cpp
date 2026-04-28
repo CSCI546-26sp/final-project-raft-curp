@@ -47,6 +47,18 @@ Raft::~Raft() {
   this->stop_server();
 }
 
+void Raft::set_on_become_leader(std::function<void(uint64_t)> cb) {
+  std::lock_guard<std::mutex> lock(this->mtx);
+  this->on_become_leader_ = std::move(cb);
+}
+
+uint64_t Raft::get_current_term() const {
+  std::lock_guard<std::mutex> lock(this->mtx);
+  return this->current_term;
+}
+
+uint64_t Raft::get_id() const { return this->id; }
+
 void Raft::signal_replication() {
   {
     std::lock_guard<std::mutex> lk(this->repl_mu_);
@@ -578,7 +590,11 @@ void Raft::send_request_votes(uint64_t term) {
         return;
       }
 
-      std::lock_guard<std::mutex> lock(this->mtx);
+      std::function<void(uint64_t)> cb;
+      bool became_leader = false;
+      uint64_t became_term = 0;
+      {
+        std::lock_guard<std::mutex> lock(this->mtx);
       if (reply.term() > this->current_term) {
         this->current_term = reply.term();
         this->role = Role::Follower;
@@ -608,7 +624,16 @@ void Raft::send_request_votes(uint64_t term) {
             this->match_index[peer_id] = 0;
             //this->send_heartbeats(this->current_term); // send initial heartbeats immediately after becoming leader
           }
+
+          cb = this->on_become_leader_;
+          became_leader = true;
+          became_term = this->current_term;
         }
+      }
+      }
+
+      if (became_leader && cb) {
+        cb(became_term);
       }
     }).detach();
   }
@@ -788,6 +813,11 @@ Raft::WitnessRecordResult Raft::witness_record(const std::string& op_type,
                                uint64_t seq_num) {
   std::lock_guard<std::mutex> lock(this->witness_mtx_);
 
+  // Recovery mode
+  if (this->witness_recovery_mode_) {
+    return {true, 0};
+  }
+
   if(op_type != "GET") {
     for(const auto & [idx, op] : unsynced_ops_) {
       if (op.key == key) {
@@ -845,6 +875,21 @@ bool Raft::witness_has_unsynced_write(const std::string& key) {
 bool Raft::has_unsynced_ops() const {
     std::lock_guard<std::mutex> lock(this->witness_mtx_); // ← not mtx
     return !unsynced_ops_.empty();
+}
+
+void Raft::witness_enter_recovery() {
+  std::lock_guard<std::mutex> lock(this->witness_mtx_);
+  this->witness_recovery_mode_ = true;
+}
+
+void Raft::witness_exit_recovery() {
+  std::lock_guard<std::mutex> lock(this->witness_mtx_);
+  this->witness_recovery_mode_ = false;
+}
+
+bool Raft::witness_in_recovery() const {
+  std::lock_guard<std::mutex> lock(this->witness_mtx_);
+  return this->witness_recovery_mode_;
 }
 
 } // namespace rafty
