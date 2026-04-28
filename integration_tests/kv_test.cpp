@@ -429,6 +429,36 @@ TEST_F(KvTestFixture, RttSlowPath) {
   std::cout << "get_curp latency (no sleep, may trigger sync): " << get_ms << "ms\n";
   std::cout << "total latency: " << total_ms << "ms\n";
 }
+TEST_F(KvTestFixture, CurpLatency) {
+  constexpr int OPS = 100;
+  auto client = make_client();
+
+  std::vector<double> lats;
+  lats.reserve(OPS);
+
+  for (int i = 0; i < OPS; ++i) {
+    auto key = "curp_key_" + std::to_string(i);
+    auto start = std::chrono::steady_clock::now();
+    client->put_curp(key, "value");
+    auto end = std::chrono::steady_clock::now();
+    lats.push_back(
+        std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+            end - start).count());
+  }
+
+  std::sort(lats.begin(), lats.end());
+  double avg = std::accumulate(lats.begin(), lats.end(), 0.0) /
+               static_cast<double>(lats.size());
+  double p50 = lats[lats.size() * 0.50];
+  double p99 = lats[lats.size() * 0.99];
+
+  std::cout << "\n CURP Fast Path Latency (1 RTT)\n";
+  std::cout << "put_curp avg=" << avg << "ms  p50=" << p50 << "ms  p99=" << p99 << "ms\n";
+  std::cout << "\n";
+
+  logger->info("CurpLatency: avg={:.2f}ms p50={:.2f}ms p99={:.2f}ms",
+               avg, p50, p99);
+}
 
 // ---------------------------------------------------------------------------
 // main
