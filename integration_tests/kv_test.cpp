@@ -342,6 +342,36 @@ TEST_F(KvTestFixture, PutOverwriteC) {
   auto [s3, v3] = client->get("overwrite");
   ASSERT_EQ(v3, "v3");
 }
+TEST_F(KvTestFixture, BaselineLatency) {
+  constexpr int OPS = 100;
+  auto client = make_client();
+
+  std::vector<double> lats;
+  lats.reserve(OPS);
+
+  for (int i = 0; i < OPS; ++i) {
+    auto key = "baseline_key_" + std::to_string(i);
+    auto start = std::chrono::steady_clock::now();
+    client->put(key, "value");
+    auto end = std::chrono::steady_clock::now();
+    lats.push_back(
+        std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+            end - start).count());
+  }
+
+  std::sort(lats.begin(), lats.end());
+  double avg = std::accumulate(lats.begin(), lats.end(), 0.0) /
+               static_cast<double>(lats.size());
+  double p50 = lats[lats.size() * 0.50];
+  double p99 = lats[lats.size() * 0.99];
+
+  std::cout << "\n==== Baseline Raft Latency (2 RTT) ====\n";
+  std::cout << "put avg=" << avg << "ms  p50=" << p50 << "ms  p99=" << p99 << "ms\n";
+  std::cout << "=======================================\n";
+
+  logger->info("BaselineLatency: avg={:.2f}ms p50={:.2f}ms p99={:.2f}ms",
+               avg, p50, p99);
+}
 
 // ---------------------------------------------------------------------------
 // main
