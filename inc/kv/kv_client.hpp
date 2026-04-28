@@ -86,8 +86,10 @@ public:
     uint64_t seq = ++seq_num_;
 
     auto witness_fut = std::async(std::launch::async, [&]() {
-      return witness_superquorum_record("PUT", key, value, client_id_, seq, 2);
+      return witness_superquorum_record("PUT", key, value, client_id_, seq, 4);
     });
+
+    kvpb::KvStatus leader_status = kvpb::KV_TIMEOUT;
 
     for (int attempt = 0; attempt < max_attempts_; ++attempt) {
       kvpb::PutRequest request;
@@ -101,16 +103,24 @@ public:
       context.set_deadline(std::chrono::system_clock::now() + rpc_timeout_);
       auto status = stubs_[leader_idx_]->Put(&context, request, &response);
 
-      bool witnesses_ok = witness_fut.get();
-
       if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
-        if(witnesses_ok){
-          return kvpb::KV_SUCCESS;
-        }
-        return sync_latest();
+        leader_status = kvpb::KV_SUCCESS;
+        break;
       }
       rotate_leader();
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // witness_fut.get() called once outside the loop because calling it inside
+    //loop causes std::future_error on retry since a future can only
+    // be consumed once.
+    bool witnesses_ok = witness_fut.get();
+
+    if (leader_status == kvpb::KV_SUCCESS) {
+      if (witnesses_ok) {
+        return kvpb::KV_SUCCESS;
+      }
+      return sync_latest();
     }
     return kvpb::KV_TIMEOUT;
   }
@@ -268,9 +278,12 @@ public:
 
   kvpb::KvStatus append_curp(const std::string &key, const std::string &value) {
     uint64_t seq = ++seq_num_;
+
     auto witness_fut = std::async(std::launch::async, [&]() {
-      return witness_superquorum_record("APPEND", key, value, client_id_, seq, 2);
+      return witness_superquorum_record("APPEND", key, value, client_id_, seq, 4);
     });
+
+    kvpb::KvStatus leader_status = kvpb::KV_TIMEOUT;
 
     for (int attempt = 0; attempt < max_attempts_; ++attempt) {
       kvpb::AppendRequest request;
@@ -284,16 +297,24 @@ public:
       context.set_deadline(std::chrono::system_clock::now() + rpc_timeout_);
       auto status = stubs_[leader_idx_]->Append(&context, request, &response);
 
-      bool witnesses_ok = witness_fut.get();
-
       if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
-        if(witnesses_ok) {
-          return kvpb::KV_SUCCESS;
-        }
-        return sync_latest();
+        leader_status = kvpb::KV_SUCCESS;
+        break;
       }
       rotate_leader();
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // witness_fut.get() called once outside the loop because calling it inside
+    // loop causes std::future_error on retry since a future can only
+    // be consumed once.
+    bool witnesses_ok = witness_fut.get();
+
+    if (leader_status == kvpb::KV_SUCCESS) {
+      if (witnesses_ok) {
+        return kvpb::KV_SUCCESS;
+      }
+      return sync_latest();
     }
     return kvpb::KV_TIMEOUT;
   }
