@@ -9,6 +9,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <mutex>
 
 #include <ddb/integration.hpp>
 
@@ -23,6 +24,11 @@
 #include "toolings/test_ctrl.hpp"
 
 #include "kv/kv_client.hpp"
+
+
+#ifdef TRACING
+#include "common/utils/tracing.hpp"
+#endif
 
 using namespace toolings;
 
@@ -47,6 +53,12 @@ protected:
   static constexpr uint64_t RAFT_BASE_PORT = 50050;
 
   void SetUp() override {
+    #ifdef TRACING
+      static std::once_flag otel_init;
+      std::call_once(otel_init, []() {
+        tracing::InitOtelInfra("kv_test_client");
+      });
+    #endif
     rafty::utils::init_logger();
 
     auto test_name = ::testing::UnitTest::GetInstance()
