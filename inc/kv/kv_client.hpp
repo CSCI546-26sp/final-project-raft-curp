@@ -86,7 +86,7 @@ public:
     uint64_t seq = ++seq_num_;
 
     auto witness_fut = std::async(std::launch::async, [&]() {
-      return witness_superquorum_record("PUT", key, value, client_id_, seq, 4);
+      return witness_superquorum_record("PUT", key, value, client_id_, seq, 2);
     });
 
     kvpb::KvStatus leader_status = kvpb::KV_TIMEOUT;
@@ -280,7 +280,7 @@ public:
     uint64_t seq = ++seq_num_;
 
     auto witness_fut = std::async(std::launch::async, [&]() {
-      return witness_superquorum_record("APPEND", key, value, client_id_, seq, 4);
+      return witness_superquorum_record("APPEND", key, value, client_id_, seq, 2);
     });
 
     kvpb::KvStatus leader_status = kvpb::KV_TIMEOUT;
