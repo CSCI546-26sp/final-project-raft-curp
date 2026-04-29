@@ -431,7 +431,10 @@ TEST_F(KvTestFixture, RttSlowPath) {
 TEST_F(KvTestFixture, CurpLatency) {
   constexpr int OPS = 100;
   auto client = make_client();
-
+  for (int i = 0; i < 10; i++) {
+    client->put_curp("warmup_" + std::to_string(i), "val");
+    client->sync_latest();
+  }
   std::vector<double> lats;
   lats.reserve(OPS);
 
