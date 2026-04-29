@@ -15,6 +15,11 @@
 
 #include "kv.grpc.pb.h"
 
+#ifdef TRACING
+#include "common/utils/tracing.hpp"
+#endif
+
+
 namespace kv {
 
 // ---------------------------------------------------------------------------
@@ -48,9 +53,16 @@ public:
     args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 100);
 
     for (const auto &addr : addrs) {
-      auto channel = grpc::CreateCustomChannel(
-          addr, grpc::InsecureChannelCredentials(), args);
-      stubs_.push_back(kvpb::KvService::NewStub(std::move(channel)));
+      #ifdef TRACING
+        stubs_.push_back(kvpb::KvService::NewStub(
+            grpc::experimental::CreateCustomChannelWithInterceptors(
+                addr, grpc::InsecureChannelCredentials(), args,
+                tracing::CreateClientTracingInterceptors())));
+      #else
+        auto channel = grpc::CreateCustomChannel(
+            addr, grpc::InsecureChannelCredentials(), args);
+        stubs_.push_back(kvpb::KvService::NewStub(std::move(channel)));
+      #endif
     }
   }
 
@@ -85,6 +97,15 @@ public:
   kvpb::KvStatus put_curp(const std::string &key, const std::string &value) {
     uint64_t seq = ++seq_num_;
 
+    #ifdef TRACING
+      // Root span — parent of all CURP fast path operations
+      auto tracer = tracing::get_tracer();
+      auto root_span = tracer->StartSpan("curp.put_curp");
+      root_span->SetAttribute("key", key);
+      root_span->SetAttribute("seq_num", (int64_t)seq);
+      auto root_scope = tracer->WithActiveSpan(root_span);
+    #endif
+
     auto witness_fut = std::async(std::launch::async, [&]() {
       return witness_superquorum_record("PUT", key, value, client_id_, seq, 2);
     });
@@ -118,10 +139,23 @@ public:
 
     if (leader_status == kvpb::KV_SUCCESS) {
       if (witnesses_ok) {
+        #ifdef TRACING
+          root_span->SetAttribute("curp.fast_path", true);
+          root_span->SetAttribute("witnesses_ok", true);
+          root_span->End();
+        #endif
         return kvpb::KV_SUCCESS;
       }
+      #ifdef TRACING
+    root_span->SetAttribute("curp.fast_path", false);
+    root_span->SetAttribute("witnesses_ok", false);
+    root_span->End(); 
+#endif
       return sync_latest();
     }
+    #ifdef TRACING
+root_span->End();  // ← end for KV_TIMEOUT case
+#endif
     return kvpb::KV_TIMEOUT;
   }
 
@@ -201,6 +235,12 @@ public:
   }
 
   std::pair<kvpb::KvStatus, std::string> get_curp(const std::string &key) {
+    #ifdef TRACING
+    auto tracer = tracing::get_tracer();
+    auto root_span = tracer->StartSpan("curp.get_curp");
+    root_span->SetAttribute("key", key);
+    auto root_scope = tracer->WithActiveSpan(root_span);
+  #endif
     // Check any witness for unsynced write on this key
     bool has_conflict = false;
     for (auto &stub : stubs_) {
@@ -225,7 +265,13 @@ public:
     if (has_conflict) {
       // unsynced write on this key — wait for it to commit before reading
       auto s = sync_latest();
-      if (s != kvpb::KV_SUCCESS) return {kvpb::KV_TIMEOUT, ""};
+      if (s != kvpb::KV_SUCCESS){
+        #ifdef TRACING
+            root_span->SetAttribute("curp.sync_failed", true);
+            root_span->End();  // ← return path 1
+        #endif
+        return {kvpb::KV_TIMEOUT, ""};
+      } 
     }
 
     // safe to read — do normal get
@@ -242,11 +288,18 @@ public:
 
       auto status = stubs_[leader_idx_]->Get(&context, request, &response);
       if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
+        #ifdef TRACING
+          root_span->End();
+        #endif
         return {kvpb::KV_SUCCESS, response.value()};
       }
       rotate_leader();
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    #ifdef TRACING
+      root_span->SetAttribute("curp.get_failed", true);
+      root_span->End();  // ← return path 3
+    #endif
     return {kvpb::KV_TIMEOUT, ""};
   }
 

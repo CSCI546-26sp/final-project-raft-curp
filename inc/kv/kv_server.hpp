@@ -20,6 +20,10 @@
 #include <unordered_set>
 #include <queue>
 
+#ifdef TRACING
+#include "common/utils/tracing.hpp"
+#endif
+
 namespace kv {
 
 struct OpResult{
@@ -171,6 +175,13 @@ public:
           store_[key] = value;
           op_result = {"", kvpb::KV_SUCCESS};
           rifl_cache_[client_id] = {seq_num, op_result};
+          #ifdef TRACING
+            auto tracer = tracing::get_tracer();
+            auto bg_span = tracer->StartSpan("curp.background_committed");
+            bg_span->SetAttribute("key", key);
+            bg_span->SetAttribute("raft.index", result.index);
+            bg_span->End();
+          #endif
         } else if (op == "APPEND") {
           store_[key] += value;
           op_result = {"", kvpb::KV_SUCCESS};
@@ -222,6 +233,14 @@ public:
   grpc::Status Put(grpc::ServerContext *context,
                    const kvpb::PutRequest *request,
                    kvpb::KvResponse *response) override {
+
+    #ifdef TRACING
+      auto tracer = tracing::get_tracer();
+      auto span = tracer->StartSpan("curp.put_fast_path");
+      span->SetAttribute("key", request->key());
+      auto scope = tracer->WithActiveSpan(span);
+    #endif
+
     // TODO (lab 3): implement
     (void)context;
 
@@ -249,6 +268,12 @@ public:
     // }
     response->set_status(kvpb::KV_SUCCESS);
     enqueue_fast_path_proposal(op);
+
+    #ifdef TRACING
+      span->SetAttribute("curp.fast_path_reply", true);
+      span->End();
+    #endif
+
     return grpc::Status::OK;
 
     // auto proposal = raft_.propose(op);
@@ -390,6 +415,14 @@ public:
     return grpc::Status::OK;
   }
 
+  #ifdef TRACING
+    auto tracer = tracing::get_tracer();
+    auto sync_span = tracer->StartSpan("curp.sync_wait");
+    sync_span->SetAttribute("client_id", (int64_t)request->client_id());
+    sync_span->SetAttribute("seq_num", (int64_t)request->seq_num());
+    auto scope = tracer->WithActiveSpan(sync_span);
+  #endif
+
   // Wait until this client's seq_num appears in rifl_cache_
   // meaning on_apply() has processed and committed it to store_
   const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -400,17 +433,29 @@ public:
       auto it = rifl_cache_.find(request->client_id());
       if (it != rifl_cache_.end() && it->second.seq_num >= request->seq_num()) {
         // op has been committed and applied to store_
+        #ifdef TRACING
+          sync_span->SetAttribute("curp.sync_result", "committed");
+          sync_span->End();
+        #endif
         response->set_status(kvpb::KV_SUCCESS);
         return grpc::Status::OK;
       }
     }
 
     if (std::chrono::steady_clock::now() >= wait_deadline) {
+      #ifdef TRACING
+      sync_span->SetAttribute("curp.sync_result", "timeout");
+      sync_span->End();
+#endif
       response->set_status(kvpb::KV_TIMEOUT);
       return grpc::Status::OK;
     }
 
     if (!raft_.get_state().is_leader) {
+      #ifdef TRACING
+      sync_span->SetAttribute("curp.sync_result", "not_leader");
+      sync_span->End();
+#endif
       response->set_status(kvpb::KV_NOTLEADER);
       return grpc::Status::OK;
     }

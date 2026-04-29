@@ -104,6 +104,10 @@ private:
     std::string addr = "0.0.0.0:" + std::to_string(port);
     builder.AddListeningPort(addr, grpc::InsecureServerCredentials());
     builder.RegisterService(kv_server_.get());
+    #ifdef TRACING
+    builder.experimental().SetInterceptorCreators(
+        tracing::CreateServerTracingInterceptors());
+#endif
     kv_grpc_server_ = builder.BuildAndStart();
     std::cout << "KV server listening on " << addr << std::endl;
     std::thread([this] { kv_grpc_server_->Wait(); }).detach();
