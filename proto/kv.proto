@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package kvpb;
+
+service KvService {
+  rpc Put(PutRequest) returns (KvResponse) {}
+  rpc Get(GetRequest) returns (GetResponse) {}
+  rpc Append(AppendRequest) returns (KvResponse) {}
+  rpc WitnessRecord(WitnessRecordRequest) returns (WitnessRecordReply) {}
+  rpc WitnessGetRecoveryData(WitnessGetRecoveryDataRequest) returns (WitnessGetRecoveryDataReply) {}
+  // Exit witness recovery mode and optionally clear witness state.
+  rpc WitnessEndRecovery(WitnessEndRecoveryRequest) returns (WitnessEndRecoveryReply) {}
+  rpc Sync(SyncRequest) returns (SyncResponse) {}
+}
+
+enum KvStatus {
+  KV_SUCCESS = 0;
+  KV_NOTLEADER = 1;
+  KV_TIMEOUT = 2;
+}
+
+message PutRequest {
+  string key = 1;
+  string value = 2;
+  uint64 client_id = 3;  // RIFL: unique client identifier
+  uint64 seq_num = 4;    // RIFL: monotonically increasing per-client sequence number
+}
+
+message GetRequest {
+  string key = 1;
+  uint64 client_id = 2;
+  uint64 seq_num = 3;
+}
+
+message AppendRequest {
+  string key = 1;
+  string value = 2;
+  uint64 client_id = 3;
+  uint64 seq_num = 4;
+}
+
+message KvResponse {
+  KvStatus status = 1;
+}
+
+message GetResponse {
+  KvStatus status = 1;
+  string value = 2;
+}
+
+message WitnessRecordRequest {
+  string op_type = 1;
+  string key = 2;
+  string value = 3;
+  uint64 client_id = 4;
+  uint64 seq_num = 5;
+}
+
+message WitnessRecordReply {
+  bool conflict = 1;
+  uint64 witness_idx = 2;
+}
+
+message WitnessGetRecoveryDataRequest {}
+
+message WitnessOp {
+  string op_type = 1;
+  string key = 2;
+  string value = 3;
+  uint64 client_id = 4;
+  uint64 seq_num = 5;
+}
+
+message WitnessGetRecoveryDataReply {
+  repeated WitnessOp ops = 1;
+}
+
+message WitnessEndRecoveryRequest {
+  bool clear = 1; // if true, drop all witness records
+}
+
+message WitnessEndRecoveryReply {
+  KvStatus status = 1;
+}
+
+message SyncRequest {
+  uint64 client_id = 1;
+  uint64 seq_num = 2;
+}
+
+message SyncResponse {
+  KvStatus status = 1;
+}
+
