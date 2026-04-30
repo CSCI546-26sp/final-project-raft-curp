@@ -19,7 +19,6 @@
 #include "common/utils/tracing.hpp"
 #endif
 
-
 namespace kv {
 
 // ---------------------------------------------------------------------------
@@ -77,8 +76,7 @@ public:
 
       kvpb::KvResponse response;
       grpc::ClientContext context;
-      context.set_deadline(std::chrono::system_clock::now() +
-                           rpc_timeout_);
+      context.set_deadline(std::chrono::system_clock::now() + rpc_timeout_);
 
       auto status = stubs_[leader_idx_]->Put(&context, request, &response);
       if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
@@ -98,7 +96,6 @@ public:
     uint64_t seq = ++seq_num_;
 
     #ifdef TRACING
-      // Root span — parent of all CURP fast path operations
       auto tracer = tracing::get_tracer();
       auto root_span = tracer->StartSpan("curp.put_curp");
       root_span->SetAttribute("key", key);
@@ -133,12 +130,13 @@ public:
     }
 
     // witness_fut.get() called once outside the loop because calling it inside
-    //loop causes std::future_error on retry since a future can only
+    // the loop causes std::future_error on retry since a future can only
     // be consumed once.
     bool witnesses_ok = witness_fut.get();
 
     if (leader_status == kvpb::KV_SUCCESS) {
       if (witnesses_ok) {
+        fast_path_hits_.fetch_add(1, std::memory_order_relaxed);
         #ifdef TRACING
           root_span->SetAttribute("curp.fast_path", true);
           root_span->SetAttribute("witnesses_ok", true);
@@ -146,20 +144,22 @@ public:
         #endif
         return kvpb::KV_SUCCESS;
       }
+      slow_path_hits_.fetch_add(1, std::memory_order_relaxed);
       #ifdef TRACING
-    root_span->SetAttribute("curp.fast_path", false);
-    root_span->SetAttribute("witnesses_ok", false);
-    root_span->End(); 
-#endif
+        root_span->SetAttribute("curp.fast_path", false);
+        root_span->SetAttribute("witnesses_ok", false);
+        root_span->End();
+      #endif
       return sync_latest();
     }
     #ifdef TRACING
-root_span->End();  // ← end for KV_TIMEOUT case
-#endif
+      root_span->End();
+    #endif
     return kvpb::KV_TIMEOUT;
   }
 
-  // Attempt CURP fast-path witness recording: returns true if a superquorum of witnesses replied conflict-free
+  // Attempt CURP fast-path witness recording: returns true if a superquorum
+  // of witnesses replied conflict-free
   bool witness_superquorum_record(const std::string &op_type,
                                   const std::string &key,
                                   const std::string &value,
@@ -183,7 +183,8 @@ root_span->End();  // ← end for KV_TIMEOUT case
 
         kvpb::WitnessRecordReply response;
         grpc::ClientContext context;
-        context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(750));
+        context.set_deadline(std::chrono::system_clock::now() +
+                             std::chrono::milliseconds(750));
 
         auto status = stub->WitnessRecord(&context, request, &response);
         if (!status.ok()) {
@@ -220,8 +221,7 @@ root_span->End();  // ← end for KV_TIMEOUT case
 
       kvpb::GetResponse response;
       grpc::ClientContext context;
-      context.set_deadline(std::chrono::system_clock::now() +
-                           rpc_timeout_);
+      context.set_deadline(std::chrono::system_clock::now() + rpc_timeout_);
 
       auto status = stubs_[leader_idx_]->Get(&context, request, &response);
       if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
@@ -236,11 +236,12 @@ root_span->End();  // ← end for KV_TIMEOUT case
 
   std::pair<kvpb::KvStatus, std::string> get_curp(const std::string &key) {
     #ifdef TRACING
-    auto tracer = tracing::get_tracer();
-    auto root_span = tracer->StartSpan("curp.get_curp");
-    root_span->SetAttribute("key", key);
-    auto root_scope = tracer->WithActiveSpan(root_span);
-  #endif
+      auto tracer = tracing::get_tracer();
+      auto root_span = tracer->StartSpan("curp.get_curp");
+      root_span->SetAttribute("key", key);
+      auto root_scope = tracer->WithActiveSpan(root_span);
+    #endif
+
     // Check any witness for unsynced write on this key
     bool has_conflict = false;
     for (auto &stub : stubs_) {
@@ -253,7 +254,7 @@ root_span->End();  // ← end for KV_TIMEOUT case
       kvpb::WitnessRecordReply response;
       grpc::ClientContext context;
       context.set_deadline(std::chrono::system_clock::now() +
-                          std::chrono::milliseconds(750));
+                           std::chrono::milliseconds(750));
 
       auto status = stub->WitnessRecord(&context, request, &response);
       if (status.ok() && response.conflict()) {
@@ -265,13 +266,13 @@ root_span->End();  // ← end for KV_TIMEOUT case
     if (has_conflict) {
       // unsynced write on this key — wait for it to commit before reading
       auto s = sync_latest();
-      if (s != kvpb::KV_SUCCESS){
+      if (s != kvpb::KV_SUCCESS) {
         #ifdef TRACING
-            root_span->SetAttribute("curp.sync_failed", true);
-            root_span->End();  // ← return path 1
+          root_span->SetAttribute("curp.sync_failed", true);
+          root_span->End();
         #endif
         return {kvpb::KV_TIMEOUT, ""};
-      } 
+      }
     }
 
     // safe to read — do normal get
@@ -298,7 +299,7 @@ root_span->End();  // ← end for KV_TIMEOUT case
     }
     #ifdef TRACING
       root_span->SetAttribute("curp.get_failed", true);
-      root_span->End();  // ← return path 3
+      root_span->End();
     #endif
     return {kvpb::KV_TIMEOUT, ""};
   }
@@ -314,11 +315,9 @@ root_span->End();  // ← end for KV_TIMEOUT case
 
       kvpb::KvResponse response;
       grpc::ClientContext context;
-      context.set_deadline(std::chrono::system_clock::now() +
-                           rpc_timeout_);
+      context.set_deadline(std::chrono::system_clock::now() + rpc_timeout_);
 
-      auto status =
-          stubs_[leader_idx_]->Append(&context, request, &response);
+      auto status = stubs_[leader_idx_]->Append(&context, request, &response);
       if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
         return kvpb::KV_SUCCESS;
       }
@@ -359,20 +358,22 @@ root_span->End();  // ← end for KV_TIMEOUT case
     }
 
     // witness_fut.get() called once outside the loop because calling it inside
-    // loop causes std::future_error on retry since a future can only
+    // the loop causes std::future_error on retry since a future can only
     // be consumed once.
     bool witnesses_ok = witness_fut.get();
 
     if (leader_status == kvpb::KV_SUCCESS) {
       if (witnesses_ok) {
+        fast_path_hits_.fetch_add(1, std::memory_order_relaxed);
         return kvpb::KV_SUCCESS;
       }
+      slow_path_hits_.fetch_add(1, std::memory_order_relaxed);
       return sync_latest();
     }
     return kvpb::KV_TIMEOUT;
   }
 
-  // UNUSED -- added sync_latest instead
+ 
   kvpb::KvStatus sync(uint64_t client_id, uint64_t seq_num) {
     for (int attempt = 0; attempt < max_attempts_; ++attempt) {
       kvpb::SyncRequest request;
@@ -393,23 +394,52 @@ root_span->End();  // ← end for KV_TIMEOUT case
     return kvpb::KV_TIMEOUT;
   }
 
+  // sync_latest: waits for this client's last operation to be committed and
+  // applied to the KV store before returning. Uses the Sync RPC which blocks
+  // until rifl_cache[client_id].since seq_num >= seq_num_ it will guarantee the write
+  // is durable before the caller proceeds.
   kvpb::KvStatus sync_latest() {
+    uint64_t seq = seq_num_.load();
     for (int attempt = 0; attempt < max_attempts_; ++attempt) {
-      kvpb::GetRequest request;
-      request.set_key("__sync__");
+      kvpb::SyncRequest request;
       request.set_client_id(client_id_);
-      request.set_seq_num(++seq_num_);
+      request.set_seq_num(seq);
 
-      kvpb::GetResponse response;
+      kvpb::SyncResponse response;
       grpc::ClientContext context;
       context.set_deadline(std::chrono::system_clock::now() + rpc_timeout_);
 
-      auto status = stubs_[leader_idx_]->Get(&context, request, &response);
-      if (status.ok()) return kvpb::KV_SUCCESS;
+      auto status = stubs_[leader_idx_]->Sync(&context, request, &response);
+      if (status.ok() && response.status() == kvpb::KV_SUCCESS) {
+        return kvpb::KV_SUCCESS;
+      }
       rotate_leader();
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return kvpb::KV_TIMEOUT;
+  }
+
+  uint64_t fast_path_hits() const {
+    return fast_path_hits_.load(std::memory_order_relaxed);
+  }
+
+  uint64_t slow_path_hits() const {
+    return slow_path_hits_.load(std::memory_order_relaxed);
+  }
+
+  uint64_t total_write_ops() const {
+    return fast_path_hits() + slow_path_hits();
+  }
+
+  double fast_path_hit_rate() const {
+    uint64_t total = total_write_ops();
+    if (total == 0) return 0.0;
+    return static_cast<double>(fast_path_hits()) / static_cast<double>(total);
+  }
+
+  void reset_stats() {
+    fast_path_hits_.store(0, std::memory_order_relaxed);
+    slow_path_hits_.store(0, std::memory_order_relaxed);
   }
 
   uint64_t client_id() const { return client_id_; }
@@ -423,6 +453,8 @@ private:
   uint64_t client_id_;
   std::atomic<uint64_t> seq_num_;
   size_t leader_idx_;
+  std::atomic<uint64_t> fast_path_hits_{0};
+  std::atomic<uint64_t> slow_path_hits_{0};
 
   static constexpr int max_attempts_ = 50;
   static constexpr std::chrono::seconds rpc_timeout_{5};

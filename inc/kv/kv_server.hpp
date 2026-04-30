@@ -39,8 +39,6 @@ struct RiflEntry{
 class KvServer : public kvpb::KvService::Service {
 public:
   explicit KvServer(rafty::Raft &raft) : raft_(raft) {
-    // TODO (lab 3): initialize your data structures here.
-    // You may want to start background threads, set up condition variables, etc.
     proposal_worker_ = std::thread([this]() {
         while (!stopped_.load()) {
             std::unique_lock<std::mutex> lk(proposal_mu_);
@@ -68,14 +66,11 @@ public:
         }
     });
 
-    // recovery trigger: when this node becomes leader, freeze witness
-    // and replay pending witness ops into Raft before serving new requests.
     raft_.set_on_become_leader(
         [this](uint64_t term) { this->on_become_leader(term); });
   }
 
   ~KvServer() {
-    // TODO (lab 3): clean up any background threads.
     stopped_.store(true);
     proposal_cv_.notify_all();
     if (proposal_worker_.joinable()) {
@@ -94,7 +89,6 @@ public:
   std::future<OpResult> register_waiter(uint64_t index){
     std::lock_guard<std::mutex> lock(mu_);
 
-    // If already applied before waiter registration, return immediately.
     auto rit = applied_results_.find(index);
     if (rit != applied_results_.end()) {
       std::promise<OpResult> p;
@@ -117,21 +111,9 @@ public:
     return std::nullopt;
   }
 
-  // -----------------------------------------------------------------
-  // on_apply is called by the node wrapper each time Raft commits a
-  // log entry. The ApplyResult contains the index and data of the
-  // committed entry (the same string you passed to raft_.propose()).
-  //
-  // You should:
-  //   1. Deserialize the operation from result.data
-  //   2. Apply it to your in-memory key/value map
-  //   3. Handle RIFL duplicate detection
-  //   4. Notify the waiting RPC handler that its operation has committed
-  // -----------------------------------------------------------------
   void on_apply(const rafty::ApplyResult &result) {
     fprintf(stderr, "[CURP] on_apply index=%lu valid=%d data=%s\n",
             result.index, result.valid, result.data.c_str());
-    // TODO (lab 3): implement this.
     if(!result.valid) {
       std::lock_guard<std::mutex> lock(mu_);
       auto wit = waiters_.find(result.index);
@@ -139,9 +121,6 @@ public:
         wit->second.set_value({"", kvpb::KV_TIMEOUT});
         waiters_.erase(wit);
       } else {
-        // If an RPC timed out waiting for this index, don't keep a result
-        // buffer around forever. The KV state is still correct (no-op for
-        // invalid apply), and client retries will be handled via Raft/RIFL.
         if (abandoned_indices_.erase(result.index) == 0) {
           applied_results_[result.index] = {"", kvpb::KV_TIMEOUT};
         }
@@ -201,8 +180,6 @@ public:
       } else if (fast_path_indices_.erase(result.index)) {
         // SKIP DO NOTHING
       } else {
-        // If the waiting RPC already timed out, don't retain a buffered result.
-        // We still applied to store_ and updated rifl_cache_ above.
         if (abandoned_indices_.erase(result.index) == 0) {
           applied_results_[result.index] = op_result;
         }
@@ -215,20 +192,6 @@ public:
     }
   }
 
-  // -----------------------------------------------------------------
-  // gRPC handlers for client operations.
-  //
-  // Each handler should:
-  //   1. Check if this node is the Raft leader (if not, return KV_NOTLEADER)
-  //   2. Serialize the operation into a string
-  //   3. Call raft_.propose(serialized_op) to submit to Raft
-  //   4. Wait for on_apply() to process the committed entry at the
-  //      returned index
-  //   5. Return the result to the client
-  //
-  // Use RIFL (client_id + seq_num) to detect and handle duplicate
-  // requests, just like Lab 0b.
-  // -----------------------------------------------------------------
 
   grpc::Status Put(grpc::ServerContext *context,
                    const kvpb::PutRequest *request,
@@ -241,17 +204,23 @@ public:
       auto scope = tracer->WithActiveSpan(span);
     #endif
 
-    // TODO (lab 3): implement
     (void)context;
 
     if (!raft_.get_state().is_leader) {
       response->set_status(kvpb::KV_NOTLEADER);
+      #ifdef TRACING
+        span->SetAttribute("curp.fast_path_reply", false);
+        span->End();
+      #endif
       return grpc::Status::OK;
     }
 
-    // RIFL duplicate detection: if already executed, return cached result.
     if (auto cached = check_rifl_cache(request->client_id(), request->seq_num())) {
       response->set_status(cached->status);
+      #ifdef TRACING
+        span->SetAttribute("curp.fast_path_reply", true);
+        span->End();
+      #endif
       return grpc::Status::OK;
     }
 
@@ -259,15 +228,17 @@ public:
                       "\t" + std::to_string(request->client_id()) +
                       "\t" + std::to_string(request->seq_num());
 
-    // Always reply immediately — master never waits for Raft
-    // {
-    //   std::lock_guard<std::mutex> lock(mu_);
-    //   rifl_cache_[request->client_id()] = {
-    //     request->seq_num(), {"", kvpb::KV_SUCCESS}
-    //   };
-    // }
+    auto proposal = raft_.propose(op);
+    if (!proposal.is_leader) {
+      response->set_status(kvpb::KV_NOTLEADER);
+      #ifdef TRACING
+        span->SetAttribute("curp.fast_path_reply", false);
+        span->End();
+      #endif
+      return grpc::Status::OK;
+    }
+
     response->set_status(kvpb::KV_SUCCESS);
-    enqueue_fast_path_proposal(op);
 
     #ifdef TRACING
       span->SetAttribute("curp.fast_path_reply", true);
@@ -275,32 +246,11 @@ public:
     #endif
 
     return grpc::Status::OK;
-
-    // auto proposal = raft_.propose(op);
-    // if(!proposal.is_leader) {
-    //   response->set_status(kvpb::KV_NOTLEADER);
-    //   return grpc::Status::OK;
-    // }
-
-    // auto fut = register_waiter(proposal.index);
-
-    // if(fut.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
-    //   std::lock_guard<std::mutex> lock(mu_);
-    //   waiters_.erase(proposal.index);
-    //   abandoned_indices_.insert(proposal.index);
-    //   response->set_status(kvpb::KV_TIMEOUT);
-    //   return grpc::Status::OK;
-    // }
-
-    // auto op_result = fut.get();
-    // response->set_status(op_result.status);
-    // return grpc::Status::OK;
   }
 
   grpc::Status Get(grpc::ServerContext *context,
                    const kvpb::GetRequest *request,
                    kvpb::GetResponse *response) override {
-    // TODO (lab 3): implement
     (void)context;
 
     if(!raft_.get_state().is_leader) {
@@ -308,7 +258,6 @@ public:
       return grpc::Status::OK;
     }
 
-    // RIFL duplicate detection: if already executed, return cached result.
     if (auto cached = check_rifl_cache(request->client_id(), request->seq_num())) {
       response->set_status(cached->status);
       response->set_value(cached->value);
@@ -335,7 +284,6 @@ public:
         return grpc::Status::OK;
       }
 
-      // Avoid calling into Raft from the CV predicate (extra locking per wakeup).
       std::unique_lock<std::mutex> lk(kv_applied_wait_mu_);
       (void)kv_applied_cv_.wait_until(lk, wait_deadline, [&] {
         return last_kv_applied_up_to_.load(std::memory_order_acquire) >= commit_upto;
@@ -355,7 +303,6 @@ public:
   grpc::Status Append(grpc::ServerContext *context,
                       const kvpb::AppendRequest *request,
                       kvpb::KvResponse *response) override {
-    // TODO (lab 3): implement
     (void)context;
 
     if (!raft_.get_state().is_leader) {
@@ -363,7 +310,6 @@ public:
       return grpc::Status::OK;
     }
 
-    // RIFL duplicate detection: if already executed, return cached result.
     if (auto cached = check_rifl_cache(request->client_id(), request->seq_num())) {
       response->set_status(cached->status);
       return grpc::Status::OK;
@@ -373,36 +319,14 @@ public:
                       "\t" + std::to_string(request->client_id()) +
                       "\t" + std::to_string(request->seq_num());
 
-    // Always reply immediately — master never waits for Raft
-    // {
-    //   std::lock_guard<std::mutex> lock(mu_);
-    //   rifl_cache_[request->client_id()] = {
-    //     request->seq_num(), {"", kvpb::KV_SUCCESS}
-    //   };
-    // }
+    auto proposal = raft_.propose(op);
+    if (!proposal.is_leader) {
+      response->set_status(kvpb::KV_NOTLEADER);
+      return grpc::Status::OK;
+    }
+
     response->set_status(kvpb::KV_SUCCESS);
-    enqueue_fast_path_proposal(op);
     return grpc::Status::OK;
-
-    // auto proposal = raft_.propose(op);
-    // if(!proposal.is_leader) {
-    //   response->set_status(kvpb::KV_NOTLEADER);
-    //   return grpc::Status::OK;
-    // }
-
-    // auto fut = register_waiter(proposal.index);
-
-    // if(fut.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
-    //   std::lock_guard<std::mutex> lock(mu_);
-    //   waiters_.erase(proposal.index);
-    //   abandoned_indices_.insert(proposal.index);
-    //   response->set_status(kvpb::KV_TIMEOUT);
-    //   return grpc::Status::OK;
-    // }
-
-    // auto op_result = fut.get();
-    // response->set_status(op_result.status);
-    // return grpc::Status::OK;
   }
 
   grpc::Status Sync(grpc::ServerContext *context,
@@ -423,8 +347,6 @@ public:
     auto scope = tracer->WithActiveSpan(sync_span);
   #endif
 
-  // Wait until this client's seq_num appears in rifl_cache_
-  // meaning on_apply() has processed and committed it to store_
   const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 
   while (true) {
@@ -432,7 +354,6 @@ public:
       std::lock_guard<std::mutex> lock(mu_);
       auto it = rifl_cache_.find(request->client_id());
       if (it != rifl_cache_.end() && it->second.seq_num >= request->seq_num()) {
-        // op has been committed and applied to store_
         #ifdef TRACING
           sync_span->SetAttribute("curp.sync_result", "committed");
           sync_span->End();
@@ -444,23 +365,22 @@ public:
 
     if (std::chrono::steady_clock::now() >= wait_deadline) {
       #ifdef TRACING
-      sync_span->SetAttribute("curp.sync_result", "timeout");
-      sync_span->End();
-#endif
+        sync_span->SetAttribute("curp.sync_result", "timeout");
+        sync_span->End();
+      #endif
       response->set_status(kvpb::KV_TIMEOUT);
       return grpc::Status::OK;
     }
 
     if (!raft_.get_state().is_leader) {
       #ifdef TRACING
-      sync_span->SetAttribute("curp.sync_result", "not_leader");
-      sync_span->End();
-#endif
+        sync_span->SetAttribute("curp.sync_result", "not_leader");
+        sync_span->End();
+      #endif
       response->set_status(kvpb::KV_NOTLEADER);
       return grpc::Status::OK;
     }
 
-    // Wait for on_apply() to fire and update rifl_cache_
     std::unique_lock<std::mutex> lk(kv_applied_wait_mu_);
     kv_applied_cv_.wait_until(lk, wait_deadline, [&] {
       std::lock_guard<std::mutex> lock(mu_);
@@ -488,7 +408,6 @@ public:
                          kvpb::WitnessGetRecoveryDataReply *response) override {
     (void)context;
     (void)request;
-    // Freeze witness for recovery: reject new WitnessRecord until explicitly ended.
     raft_.witness_enter_recovery();
     auto ops = raft_.witness_get_recovery_data();
     for (const auto &op : ops) {
@@ -515,8 +434,6 @@ public:
   }
 
   void on_become_leader(uint64_t term) {
-    // Quorum recovery: freeze a quorum of witnesses (WitnessGetRecoveryData),
-    // replay recovered ops into Raft, then unfreeze/reset witnesses.
     auto parse_port = [](const std::string &addr) -> std::optional<uint64_t> {
       auto pos = addr.rfind(':');
       if (pos == std::string::npos || pos + 1 >= addr.size()) {
@@ -594,13 +511,10 @@ public:
       }
     }
 
-    // If we couldn't freeze a quorum, do nothing (next leader will retry).
     if (got.size() < quorum) {
       return;
     }
 
-    // Pick a canonical recovery set: use the first successful witness's list.
-    // (Matches CURP intuition: replay from one consistent witness table.)
     std::vector<kvpb::WitnessOp> to_replay;
     for (const auto &op : got.front().reply.ops()) {
       to_replay.push_back(op);
@@ -615,7 +529,6 @@ public:
       }
     }
 
-    // Wait bounded for replayed ops to apply (RIFL dedups committed ops).
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
     for (const auto &op : to_replay) {
@@ -647,7 +560,6 @@ public:
       (void)stub->WitnessEndRecovery(&ctx, req, &rep);
     };
 
-    // Unfreeze/reset the witnesses we froze (best-effort).
     for (const auto &r : got) {
       end_one(r.addr);
     }
@@ -664,7 +576,6 @@ private:
   std::unordered_map<uint64_t, OpResult> applied_results_;
   std::unordered_set<uint64_t> abandoned_indices_;
 
-  // Max Raft log index applied to store_/rifl (used to sync ReadIndex-style GETs).
   std::atomic<uint64_t> last_kv_applied_up_to_{0};
   std::mutex kv_applied_wait_mu_;
   std::condition_variable kv_applied_cv_;
@@ -675,22 +586,6 @@ private:
   std::condition_variable      proposal_cv_;
   std::thread                  proposal_worker_;
   std::atomic<bool>            stopped_{false};
-
-  // TODO (lab 3): add your state here. Consider:
-  //
-  // - std::unordered_map<std::string, std::string> store_;
-  //       The in-memory key/value map.
-  //
-  // - RIFL tables: track (client_id -> highest seq_num) and cache the
-  //   response for the last operation per client, so that duplicate
-  //   requests return the cached result instead of re-executing.
-  //
-  // - A notification mechanism (e.g., std::condition_variable or
-  //   std::promise/std::future per pending request) so that RPC handler
-  //   threads can wait for their specific log entry to be committed
-  //   and applied via on_apply().
-  //
-  // - std::mutex for protecting shared state.
 };
 
 } // namespace kv
